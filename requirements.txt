@@ -1,0 +1,48 @@
+# AMM-500: US500 Index Market Making Bot Dependencies
+# Python 3.10 required for compatibility
+
+# Core SDK
+hyperliquid-python-sdk>=0.1.0
+
+# Async and networking
+asyncio-throttle>=1.0.2
+aiohttp>=3.9.0
+websockets>=12.0
+requests>=2.31.0
+
+# Data processing and performance
+numpy>=1.24.0
+pandas>=2.0.0
+numba>=0.58.0
+
+# Configuration management
+python-dotenv>=1.0.0
+
+# Logging and utilities
+loguru>=0.7.0
+tenacity>=8.2.0
+
+# Backtesting and analysis
+matplotlib>=3.8.0
+scipy>=1.11.0
+tqdm>=4.66.0
+
+# S3 archive support (optional)
+lz4>=4.3.0
+
+# Ethereum account management
+eth-account>=0.10.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+
+# Code quality
+black>=23.12.0
+pylint>=3.0.0
+mypy>=1.7.0
+
+# Type stubs
+pandas-stubs>=2.0.0
+types-requests>=2.31.0

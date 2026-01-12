@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment and secrets
+.env
+*.env
+config/.env
+!config/.env.example
+*.pem
+*.key
+*.secret
+*_secret*
+*_private*
+*.credentials
+secrets/
+.secrets/
+
+# Private keys and wallets
+*private_key*
+*privatekey*
+*wallet_key*
+*api_key*
+*apikey*
+
+# Logs
+logs/*.log
+*.log
+
+# Data cache
+data/s3_cache/*.lz4
+data/s3_cache/*.parquet
+data/*.csv
+data/*.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Distribution / packaging
+*.manifest
+*.spec
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# pyenv
+.python-version
