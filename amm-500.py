@@ -575,7 +575,9 @@ def main() -> None:
     # Force paper mode if requested (uses mainnet data, simulates orders)
     if args.paper:
         config.execution.paper_trading = True
+        config.network.testnet = False  # Use mainnet for real US500 data
         logger.info("Paper trading mode enabled (mainnet data, simulated orders)")
+        logger.info("Using mainnet for US500 prices (KM market only exists on mainnet)")
 
     # Setup logging
     setup_logging(config)

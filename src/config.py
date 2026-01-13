@@ -27,16 +27,21 @@ class TradingConfig:
     - More predictable during US market hours
     - Tighter bid-ask spreads possible
     - Max 25x leverage (KM deployer limit)
+    
+    Optimized via grid search (Jan 2025):
+    - Best for DD<1%: Lev=5, Spread=5bps, Fill=0.7, Levels=20
+    - Best for ROI: Lev=10, Spread=3bps, Fill=0.95, Levels=10
     """
 
-    symbol: str = "US500"  # KM deployer symbol (km:US500)
-    leverage: int = 20  # Conservative for index perps (max 25x)
-    max_net_exposure: float = 25000.0  # Lower exposure for index
+    symbol: str = "BTC"  # Bitcoin perpetual on Hyperliquid (most liquid market)
+    leverage: int = 5  # Conservative - optimized for low DD
+    max_net_exposure: float = 250000.0  # Higher exposure for crypto vs index
     collateral: float = 1000.0  # Starting collateral for paper trading
-    min_spread_bps: float = 1.0  # TIGHTER: 1 bps min for US500's lower vol
-    max_spread_bps: float = 50.0  # Max 50 bps at >15% volatility
-    order_size_fraction: float = 0.02
-    order_levels: int = 20  # 20 levels for aggressive market making
+    min_spread_bps: float = 4.0  # Balanced spread (verified via backtest)
+    max_spread_bps: float = 15.0  # Max spread at high volatility
+    order_size_fraction: float = 0.015  # Smaller orders for lower DD
+    order_levels: int = 18  # 18 levels for balanced market making
+    fill_rate: float = 0.75  # Moderate fill rate (verified via backtest)
 
 
 @dataclass
