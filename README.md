@@ -16,7 +16,7 @@ A high-frequency trading bot for delta-neutral market making on US500 (S&P 500 I
 
 ```bash
 # 1. Clone and enter directory
-cd AMM-500
+-
 
 # 2. Create virtual environment
 python3.10 -m venv .venv
@@ -301,6 +301,9 @@ COLLATERAL=1000
 # Fund wallet with exactly $1000 USDC
 # Start with active monitoring
 python amm-500.py
+
+# Start autonomous monitoring
+python scripts/amm_autonomous.py
 ```
 
 **Gradual Scale-Up Plan:**
