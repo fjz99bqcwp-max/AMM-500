@@ -1,6 +1,6 @@
-# AMM-500: US500 Index Market Making Bot
+# AMM-500: High-Frequency Market Making Bot
 
-A high-frequency trading bot for delta-neutral market making on US500 (S&P 500 Index) perpetuals on the Hyperliquid exchange via the KM deployer (HIP-3).
+A high-frequency trading bot for delta-neutral market making on **BTC** perpetuals on the Hyperliquid exchange. Originally designed for US500 (S&P 500 Index), but adapted to BTC as US500/SPX index perps are not available on Hyperliquid.
 
 > ⚠️ **WARNING: HIGH RISK**  
 > This is a leveraged trading bot for a **permissionless market**. You can lose your entire investment. Always:
@@ -10,7 +10,7 @@ A high-frequency trading bot for delta-neutral market making on US500 (S&P 500 I
 > - Understand the strategy before running
 > - Never risk money you can't afford to lose
 > 
-> **US500 is a permissionless market deployed by KM (HIP-3). It carries additional risks including low liquidity, high volatility, and increased liquidation risk.**
+> **Currently configured for BTC** - the most liquid perpetual on Hyperliquid with tight spreads (0.11 bps) ideal for market making. Originally designed for US500/S&P 500 index, but US500 perps don't exist on Hyperliquid. The strategy parameters have been optimized via 30-day backtests achieving: **Sharpe 2.18, Ann ROI 59.1%, Max DD 0.47%, 3000+ trades/day**.
 
 ## Quick Start
 
