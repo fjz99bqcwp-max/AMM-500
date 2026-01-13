@@ -1447,6 +1447,225 @@ async def _fetch_real_data(days: int) -> pd.DataFrame:
         await fetcher.close()
 
 
+# ============================================================================
+# M4 OPTIMIZED PARALLEL BACKTESTING (10 cores, 24GB RAM)
+# ============================================================================
+
+def _run_single_backtest(args: Tuple) -> Dict:
+    """
+    Run a single backtest with given parameters (for multiprocessing).
+    
+    Args:
+        args: Tuple of (data_df_dict, config_dict)
+        
+    Returns:
+        Dict with key metrics
+    """
+    data_dict, config_dict = args
+    
+    # Reconstruct DataFrame from dict (for pickle serialization)
+    data = pd.DataFrame(data_dict)
+    if "datetime" in data.columns:
+        data["datetime"] = pd.to_datetime(data["datetime"])
+    
+    # Create config
+    config = BacktestConfig(**config_dict)
+    
+    # Run backtest
+    engine = BacktestEngine(config)
+    result = engine.run(data)
+    
+    return {
+        "config": config_dict,
+        "total_pnl": result.net_pnl,
+        "roi_pct": result.roi_pct,
+        "sharpe_ratio": result.sharpe_ratio,
+        "max_drawdown": result.max_drawdown,
+        "total_trades": result.total_trades,
+        "win_rate": result.win_rate,
+        "trades_per_day": result.trades_per_day,
+    }
+
+
+class ParallelBacktester:
+    """
+    M4-optimized parallel backtester for parameter sweeps.
+    
+    Uses all 10 cores of Apple M4 Mac mini for maximum throughput.
+    Supports:
+    - Parameter grid search
+    - Random search
+    - Bayesian optimization (future)
+    
+    Usage:
+        backtester = ParallelBacktester()
+        best = backtester.find_optimal_params(
+            data=historical_data,
+            param_ranges={
+                "leverage": [10, 15, 20, 25],
+                "min_spread_bps": [0.5, 1.0, 2.0],
+                "order_levels": [10, 15, 20, 25],
+            }
+        )
+    """
+    
+    def __init__(self, n_workers: Optional[int] = None):
+        """Initialize with optimal worker count for M4."""
+        self.n_workers = n_workers or min(multiprocessing.cpu_count(), 10)
+        logger.info(f"ParallelBacktester initialized with {self.n_workers} workers")
+    
+    def run_parameter_sweep(
+        self, 
+        data: pd.DataFrame, 
+        param_grid: List[Dict],
+        base_config: Optional[Dict] = None
+    ) -> List[Dict]:
+        """
+        Run backtests with different parameter combinations in parallel.
+        
+        Args:
+            data: Historical OHLCV data
+            param_grid: List of parameter dictionaries to test
+            base_config: Base configuration to merge with each param set
+            
+        Returns:
+            List of results sorted by Sharpe ratio
+        """
+        from concurrent.futures import ProcessPoolExecutor
+        
+        base = base_config or {}
+        
+        # Prepare arguments (convert DataFrame to dict for pickling)
+        data_dict = data.to_dict()
+        args_list = []
+        
+        for params in param_grid:
+            config_dict = {**base, **params}
+            args_list.append((data_dict, config_dict))
+        
+        logger.info(f"Starting parallel sweep: {len(param_grid)} configs on {self.n_workers} workers")
+        start_time = time.time()
+        
+        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+            results = list(executor.map(_run_single_backtest, args_list))
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Parallel sweep complete: {len(results)} results in {elapsed:.1f}s")
+        
+        # Sort by Sharpe ratio
+        results.sort(key=lambda x: x.get("sharpe_ratio", 0), reverse=True)
+        
+        return results
+    
+    def find_optimal_params(
+        self,
+        data: pd.DataFrame,
+        param_ranges: Dict[str, List],
+        base_config: Optional[Dict] = None,
+        metric: str = "sharpe_ratio"
+    ) -> Dict:
+        """
+        Find optimal parameters using parallel grid search.
+        
+        Args:
+            data: Historical data
+            param_ranges: Dict of param_name -> list of values to try
+            base_config: Base configuration
+            metric: Metric to optimize ("sharpe_ratio", "roi_pct", "max_drawdown")
+            
+        Returns:
+            Dict with best params and result
+        """
+        import itertools
+        
+        # Generate all combinations
+        param_names = list(param_ranges.keys())
+        param_values = list(param_ranges.values())
+        combinations = list(itertools.product(*param_values))
+        
+        param_grid = []
+        for combo in combinations:
+            config = {}
+            for name, value in zip(param_names, combo):
+                config[name] = value
+            param_grid.append(config)
+        
+        logger.info(f"Grid search: {len(param_grid)} combinations")
+        
+        results = self.run_parameter_sweep(data, param_grid, base_config)
+        
+        # Find best by metric
+        if metric == "max_drawdown":
+            # Lower is better for drawdown
+            best = min(results, key=lambda x: x.get(metric, float("inf")))
+        else:
+            best = max(results, key=lambda x: x.get(metric, 0))
+        
+        logger.info(
+            f"Best params found: {metric}={best.get(metric, 0):.3f}, "
+            f"PnL=${best.get('total_pnl', 0):.2f}, "
+            f"Sharpe={best.get('sharpe_ratio', 0):.2f}"
+        )
+        
+        return {
+            "best_params": best["config"],
+            "best_result": best,
+            "all_results": results,
+        }
+    
+    def run_stress_test(
+        self,
+        data: pd.DataFrame,
+        leverage_levels: List[int] = [10, 15, 20, 25],
+        base_config: Optional[Dict] = None
+    ) -> Dict:
+        """
+        Run stress test at multiple leverage levels.
+        
+        Args:
+            data: Historical data
+            leverage_levels: Leverage levels to test
+            base_config: Base configuration
+            
+        Returns:
+            Dict with results for each leverage level
+        """
+        param_grid = [{"leverage": lev} for lev in leverage_levels]
+        results = self.run_parameter_sweep(data, param_grid, base_config)
+        
+        # Organize by leverage
+        by_leverage = {}
+        for r in results:
+            lev = r["config"]["leverage"]
+            by_leverage[lev] = r
+        
+        # Check if x25 passes safety threshold
+        x25_safe = False
+        if 25 in by_leverage:
+            x25_result = by_leverage[25]
+            x25_safe = x25_result.get("max_drawdown", 1.0) < 0.05
+        
+        return {
+            "results": by_leverage,
+            "x25_safe": x25_safe,
+            "recommended_leverage": self._get_recommended_leverage(by_leverage),
+        }
+    
+    def _get_recommended_leverage(self, results: Dict[int, Dict]) -> int:
+        """Determine recommended leverage based on stress test results."""
+        # Find highest leverage with acceptable risk
+        for lev in sorted(results.keys(), reverse=True):
+            result = results[lev]
+            if (result.get("max_drawdown", 1.0) < 0.05 and 
+                result.get("sharpe_ratio", 0) > 2.0):
+                return lev
+        return 10  # Default to conservative
+
+
+# Import time for timing
+import time
+
+
 if __name__ == "__main__":
     # Example usage - now with real data by default
     result = run_backtest(synthetic_days=30, use_real_data=True, plot=True, monte_carlo=True)

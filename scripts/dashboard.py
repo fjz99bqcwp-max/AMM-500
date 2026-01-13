@@ -16,7 +16,7 @@ URL = "https://api.hyperliquid.xyz/info"
 
 def check_bot_status():
     """Check if bot is running."""
-    result = subprocess.run(["pgrep", "-f", "mmb-1.py"], capture_output=True, text=True)
+    result = subprocess.run(["pgrep", "-f", "amm-500.py"], capture_output=True, text=True)
     if result.stdout.strip():
         return f"✅ RUNNING (PID: {result.stdout.strip()})"
     return "❌ STOPPED"
@@ -24,7 +24,7 @@ def check_bot_status():
 
 def check_monitor_status():
     """Check if monitor is running."""
-    result = subprocess.run(["pgrep", "-f", "mmb_continuous.py"], capture_output=True, text=True)
+    result = subprocess.run(["pgrep", "-f", "amm_autonomous.py"], capture_output=True, text=True)
     if result.stdout.strip():
         return f"✅ RUNNING (PID: {result.stdout.strip()})"
     return "❌ STOPPED"
@@ -165,8 +165,8 @@ def main():
     print("\n💡 Quick Commands:")
     print("   View monitor log:  tail -f logs/monitor.log")
     print("   View bot log:      tail -f logs/bot_$(date +%Y-%m-%d).log")
-    print("   Stop bot:          pkill -f mmb-1.py")
-    print("   Stop monitor:      pkill -f continuous_monitor.py")
+    print("   Stop bot:          pkill -f amm-500.py")
+    print("   Stop monitor:      pkill -f amm_autonomous.py")
     print("=" * 80)
 
 

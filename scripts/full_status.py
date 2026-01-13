@@ -102,7 +102,7 @@ def main():
     print("\n=== BOT STATUS ===")
     import subprocess
 
-    result = subprocess.run(["pgrep", "-f", "mmb-1.py"], capture_output=True, text=True)
+    result = subprocess.run(["pgrep", "-f", "amm-500.py"], capture_output=True, text=True)
     if result.returncode == 0:
         pids = result.stdout.strip().split("\n")
         print(f"  Bot running: YES (PIDs: {', '.join(pids)})")

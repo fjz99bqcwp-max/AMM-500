@@ -8,8 +8,8 @@ echo ""
 
 # Check processes
 echo "🤖 Processes:"
-if pgrep -f "mmb-1.py" > /dev/null; then
-    echo "  ✅ Bot running (PID: $(pgrep -f mmb-1.py))"
+if pgrep -f "amm-500.py" > /dev/null; then
+    echo "  ✅ Bot running (PID: $(pgrep -f amm-500.py))"
 else
     echo "  ❌ Bot STOPPED"
 fi

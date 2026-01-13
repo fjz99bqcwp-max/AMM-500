@@ -12,7 +12,7 @@ while [ $CYCLE_COUNT -lt $TARGET_CYCLES ]; do
     sleep 60
     
     # Check if monitor is still running
-    if ! ps aux | grep "mmb_continuous.py" | grep -v grep > /dev/null; then
+    if ! ps aux | grep "amm_autonomous.py" | grep -v grep > /dev/null; then
         echo "Monitor stopped running!"
         break
     fi

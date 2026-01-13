@@ -24,10 +24,15 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-WALLET = "0x90c6949CD6850c9d3995Ed438b8653Cc6CEE6283"
+# User wallet for real-time data validation
+WALLET = "0x1cCC14E273DEF02EF2BF62B9bb6B6cAa15805f9C"
 URL = "https://api.hyperliquid.xyz/info"
-BOT_SCRIPT = "/Users/nheosdisplay/VSC/MMB/MMB-1/mmb-1.py"
-STATE_FILE = "/Users/nheosdisplay/VSC/MMB/MMB-1/logs/monitor_state.json"
+
+# AMM-500 paths (auto-detected)
+BASE_DIR = Path(__file__).parent.parent
+BOT_SCRIPT = str(BASE_DIR / "amm-500.py")
+STATE_FILE = str(BASE_DIR / "logs" / "autonomous_state.json")
+VENV_PYTHON = str(BASE_DIR / ".venv" / "bin" / "python")
 
 # Performance thresholds
 MIN_SPREAD_BPS = 0.0  # Minimum acceptable spread
@@ -583,7 +588,7 @@ class PerformanceMonitor:
         """Check if bot is currently running."""
         try:
             result = subprocess.run(
-                ["pgrep", "-f", "mmb-1.py"], capture_output=True, text=True, timeout=5
+                ["pgrep", "-f", "amm-500.py"], capture_output=True, text=True, timeout=5
             )
             return result.returncode == 0
         except Exception:
@@ -595,23 +600,23 @@ class PerformanceMonitor:
         self.bot_restarts += 1
 
         # Kill existing bot gracefully
-        subprocess.run(["pkill", "-f", "mmb-1.py"], capture_output=True)
+        subprocess.run(["pkill", "-f", "amm-500.py"], capture_output=True)
         time.sleep(3)
 
         # Verify bot stopped
         if self.check_bot_running():
             log("WARN", "Bot still running, forcing kill...")
-            subprocess.run(["pkill", "-9", "-f", "mmb-1.py"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "amm-500.py"], capture_output=True)
             time.sleep(2)
 
         # Start new instance in background with proper logging
-        log_file = f"logs/bot_{datetime.now().strftime('%Y-%m-%d')}.log"
+        log_file = str(BASE_DIR / "logs" / f"bot_{datetime.now().strftime('%Y-%m-%d')}.log")
         try:
             subprocess.Popen(
-                ["/Users/nheosdisplay/VSC/MMB/MMB-1/.venv/bin/python", BOT_SCRIPT],
+                [VENV_PYTHON, BOT_SCRIPT],
                 stdout=open(log_file, "a"),
                 stderr=subprocess.STDOUT,
-                cwd="/Users/nheosdisplay/VSC/MMB/MMB-1",
+                cwd=str(BASE_DIR),
             )
             log("INFO", "✅ Bot restarted")
         except Exception as e:

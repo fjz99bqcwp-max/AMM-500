@@ -1,7 +1,9 @@
 """
-Hyperliquid HFT Bot - Source Package
-Delta-Neutral Market Making for BTC Perpetuals
+AMM-500: Autonomous Market Making for US500 Perpetuals
+Delta-Neutral Market Making on Hyperliquid via KM deployer (HIP-3)
 """
 
-__version__ = "1.0.0"
-__author__ = "HFT Bot Team"
+__version__ = "2.0.0"
+__author__ = "AMM-500 Team"
+
+from .autonomous import AutonomousRiskManager, AutonomousMode, PerformanceMetrics

@@ -8,11 +8,14 @@ Automatically adjusts strategy parameters based on performance
 import os
 import sys
 import re
+from pathlib import Path
 from typing import Dict
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-STRATEGY_FILE = "/Users/nheosdisplay/VSC/MMB/MMB-1/src/strategy.py"
+# Use relative path from script location
+BASE_DIR = Path(__file__).parent.parent
+STRATEGY_FILE = str(BASE_DIR / "src" / "strategy.py")
 
 
 class StrategyOptimizer:
