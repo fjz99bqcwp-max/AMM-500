@@ -232,8 +232,11 @@ class HyperliquidClient:
 
     # US500 tick size and lot size on Hyperliquid (KM deployer)
     # US500 prices use $0.01 tick size (index points with 2 decimals)
+    # Order sizing parameters
+    # For BTC perpetual: min size is 0.0001 BTC
+    # For US500 futures: min size is 0.01 contracts
     TICK_SIZE = 0.01
-    LOT_SIZE = 0.01  # 0.01 contract minimum
+    LOT_SIZE = 0.0001  # 0.0001 BTC minimum for BTC perpetual (was 0.01 for US500)
 
     def __init__(self, config: Config):
         """Initialize the client."""
@@ -973,6 +976,7 @@ class HyperliquidClient:
             size = round_size(req.size, self.LOT_SIZE)
 
             if size < self.LOT_SIZE:
+                logger.warning(f"[PAPER] Order size {size:.8f} too small (min={self.LOT_SIZE})")
                 orders.append(None)
                 continue
 
@@ -1438,6 +1442,62 @@ class HyperliquidClient:
 
     async def _refresh_account_state(self) -> None:
         """Refresh account state from the exchange with rate limiting."""
+        # Paper trading mode - use simulated account state
+        if self.config.execution.paper_trading:
+            # Simulate account with initial collateral
+            mark_price = self._paper_last_mid or 91000.0  # Default BTC price
+            
+            # Calculate unrealized PnL from open position
+            unrealized_pnl = 0.0
+            if self._paper_position_size != 0:
+                if self._paper_position_size > 0:
+                    unrealized_pnl = (mark_price - self._paper_entry_price) * self._paper_position_size
+                else:
+                    unrealized_pnl = (self._paper_entry_price - mark_price) * abs(self._paper_position_size)
+            
+            # Update simulated equity with realized and unrealized PnL
+            self._paper_equity = self.config.trading.collateral + self._paper_realized_pnl + unrealized_pnl
+            
+            # Create simulated position
+            positions = []
+            if self._paper_position_size != 0:
+                positions.append(
+                    Position(
+                        symbol=self.config.trading.symbol,
+                        size=self._paper_position_size,
+                        entry_price=self._paper_entry_price,
+                        mark_price=mark_price,
+                        liquidation_price=0.0,
+                        unrealized_pnl=unrealized_pnl,
+                        leverage=self.config.trading.leverage,
+                        margin_used=abs(self._paper_position_size) * mark_price / self.config.trading.leverage,
+                    )
+                )
+            
+            # Create simulated account state
+            margin_used = sum(abs(p.size) * p.mark_price / p.leverage for p in positions)
+            
+            self._account_state = AccountState(
+                equity=self._paper_equity,
+                available_balance=self._paper_equity - margin_used,
+                margin_used=margin_used,
+                unrealized_pnl=unrealized_pnl,
+                positions=positions,
+                open_orders=list(self._open_orders.values()),
+            )
+            
+            # Update position cache
+            self._positions = {p.symbol: p for p in positions}
+            
+            logger.debug(
+                f"[PAPER] Account: Equity=${self._paper_equity:.2f}, "
+                f"Position={self._paper_position_size:.4f}, "
+                f"Realized=${self._paper_realized_pnl:.2f}, "
+                f"Unrealized=${unrealized_pnl:.2f}"
+            )
+            return
+        
+        # Real trading mode - fetch from exchange
         if not self._info:
             return
 

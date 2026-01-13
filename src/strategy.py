@@ -1186,44 +1186,44 @@ class MarketMakingStrategy:
                     logger.warning("Could not get BBO for order validation, skipping placement")
                     return
 
-                # OPTIMIZATION #9: Minimal ALO margin - just enough to ensure post-only
-                # The $50 margin was DESTROYING our strategy by pushing us $50 away from BBO!
-                # ALO only requires we don't CROSS the spread, not that we're far from it.
-                # $1 margin (1 tick) is sufficient to ensure ALO acceptance.
-                ALO_MARGIN = 1.0  # Reduced from $50 to $1 - just 1 tick buffer
+            # OPTIMIZATION #9: Minimal ALO margin - just enough to ensure post-only
+            # The $50 margin was DESTROYING our strategy by pushing us $50 away from BBO!
+            # ALO only requires we don't CROSS the spread, not that we're far from it.
+            # $1 margin (1 tick) is sufficient to ensure ALO acceptance.
+            ALO_MARGIN = 1.0  # Reduced from $50 to $1 - just 1 tick buffer
 
-                validated_orders = []
-                for req in orders_to_place:
-                    if req.side == OrderSide.BUY:
-                        # Bid must be < fresh_ask to avoid crossing (not < fresh_bid!)
-                        # We CAN quote AT the best bid, just not ABOVE the best ask
-                        if req.price >= fresh_ask:
-                            # Would cross, adjust to 1 tick below best ask
-                            safe_price = fresh_ask - ALO_MARGIN
-                            req = OrderRequest(
-                                symbol=req.symbol,
-                                side=req.side,
-                                size=req.size,
-                                price=round(safe_price),
-                                time_in_force=req.time_in_force,
-                            )
-                        validated_orders.append(req)
-                    else:
-                        # Ask must be > fresh_bid to avoid crossing (not > fresh_ask!)
-                        # We CAN quote AT the best ask, just not BELOW the best bid
-                        if req.price <= fresh_bid:
-                            # Would cross, adjust to 1 tick above best bid
-                            safe_price = fresh_bid + ALO_MARGIN
-                            req = OrderRequest(
-                                symbol=req.symbol,
-                                side=req.side,
-                                size=req.size,
-                                price=round(safe_price),
-                                time_in_force=req.time_in_force,
-                            )
-                        validated_orders.append(req)
+            validated_orders = []
+            for req in orders_to_place:
+                if req.side == OrderSide.BUY:
+                    # Bid must be < fresh_ask to avoid crossing (not < fresh_bid!)
+                    # We CAN quote AT the best bid, just not ABOVE the best ask
+                    if req.price >= fresh_ask:
+                        # Would cross, adjust to 1 tick below best ask
+                        safe_price = fresh_ask - ALO_MARGIN
+                        req = OrderRequest(
+                            symbol=req.symbol,
+                            side=req.side,
+                            size=req.size,
+                            price=round(safe_price),
+                            time_in_force=req.time_in_force,
+                        )
+                    validated_orders.append(req)
+                else:
+                    # Ask must be > fresh_bid to avoid crossing (not > fresh_ask!)
+                    # We CAN quote AT the best ask, just not BELOW the best bid
+                    if req.price <= fresh_bid:
+                        # Would cross, adjust to 1 tick above best bid
+                        safe_price = fresh_bid + ALO_MARGIN
+                        req = OrderRequest(
+                            symbol=req.symbol,
+                            side=req.side,
+                            size=req.size,
+                            price=round(safe_price),
+                            time_in_force=req.time_in_force,
+                        )
+                    validated_orders.append(req)
 
-                orders_to_place = validated_orders
+            orders_to_place = validated_orders
 
             results = await self.client.place_orders_batch(orders_to_place)
 
