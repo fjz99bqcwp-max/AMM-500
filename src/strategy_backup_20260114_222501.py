@@ -1,15 +1,10 @@
 """
-Professional Market Making Strategy for Hyperliquid
-Transform from grid-based to professional HFT market making with:
-- Real-time L2 order book integration for dynamic quoting
-- Adaptive spread/sizing based on book depth and inventory
-- Volatility-adaptive exponential tiering (1-50 bps)
-- Quote fading on adverse selection detection
-- Inventory skew management for delta-neutral operation
-- Optimized for 1s quote refresh on Apple M4 hardware
+Delta-Neutral Market Making Strategy
+Core trading logic for the HFT bot.
 
-WARNING: High-frequency trading with leverage carries significant financial risk.
-Thoroughly test on testnet before using real funds.
+WARNING: This is a high-frequency trading strategy using leverage.
+It carries significant financial risk. Thoroughly test on testnet
+before using real funds. Past performance does not guarantee future results.
 """
 
 import asyncio
@@ -42,15 +37,6 @@ from .utils import (
     CircularBuffer,
     get_timestamp_ms,
 )
-
-# Optional PyTorch integration for volatility/spread prediction
-try:
-    import torch
-    import torch.nn as nn
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    logger.warning("PyTorch not available - ML predictions disabled")
 
 
 class StrategyState(Enum):
@@ -93,9 +79,6 @@ class StrategyMetrics:
     spread_capture: float = 0.0
     actions_today: int = 0
     last_reset: int = 0
-
-    # Professional MM: Adverse selection tracking
-    consecutive_losing_fills: int = 0  # Track consecutive losses for quote fading
 
     # OPT#14: Track recent fill prices AND SIZES for weighted adverse selection detection
     recent_buy_prices: List[float] = field(default_factory=list)
@@ -193,11 +176,9 @@ class StrategyMetrics:
                 self.recent_sell_sizes.pop(0)
 
 
-
-
 @dataclass
 class InventoryState:
-    """Current inventory state with delta-neutral tracking."""
+    """Current inventory state."""
 
     position_size: float = 0.0
     position_value: float = 0.0
@@ -207,58 +188,30 @@ class InventoryState:
 
     @property
     def is_balanced(self) -> bool:
-        """Check if inventory is within acceptable range (±1.5% for HFT)."""
-        return abs(self.delta) < 0.015  # Tighter tolerance for professional MM
-    
-    @property
-    def skew_urgency(self) -> float:
-        """Return urgency factor (0-1) for inventory rebalancing."""
-        return min(abs(self.delta) / 0.05, 1.0)  # Max urgency at 5%
-
-
-@dataclass
-class BookDepthAnalysis:
-    """L2 order book depth analysis for professional market making."""
-    total_bid_depth: float = 0.0
-    total_ask_depth: float = 0.0
-    imbalance: float = 0.0  # -1 to +1, positive = more bids
-    weighted_mid: float = 0.0  # Microprice
-    top_5_bid_depth: float = 0.0
-    top_5_ask_depth: float = 0.0
-    book_pressure: float = 0.0  # Directional pressure
-    
-    @property
-    def is_liquid(self) -> bool:
-        """Check if book has sufficient liquidity for quoting."""
-        # US500: Lower threshold to $5000 per side (more realistic for index)
-        return self.total_bid_depth > 5000 and self.total_ask_depth > 5000
+        """Check if inventory is roughly balanced."""
+        # RELAXED to 10%: Allows two-sided quoting more often for better fill rates
+        # 5% was too tight given minimum order sizes, causing constant rebalance mode
+        return abs(self.delta) < 0.10  # Within 10% of neutral
 
 
 class MarketMakingStrategy:
     """
-    Professional Market Making Strategy with L2 Order Book Integration.
-    
-    TRANSFORMED from grid-based to professional HFT market making:
-    - Real-time L2 order book analysis for dynamic quoting
-    - Exponentially tiered spreads (1-50 bps, concentrated near mid)
-    - Adaptive sizing based on inventory skew and book depth
-    - Volatility-adaptive spreads with ML predictions (optional)
-    - Quote fading on adverse selection detection
-    - Delta-neutral inventory management (±1.5% tolerance)
-    - Optimized for 1s quote refresh on Apple M4 hardware
-    
-    Quote Placement Philosophy:
-    - Top 3-5 levels: 1-5 bps, 70% of volume (tight for high fill rate)
-    - Middle 3-5 levels: 5-15 bps, 20% of volume
-    - Outer 3-5 levels: 15-50 bps, 10% of volume (tail risk capture)
-    
+    Delta-Neutral Market Making Strategy.
+
+    Core Logic:
+    1. Post bid and ask orders around the mid price
+    2. Capture the spread when both sides fill
+    3. Manage inventory to stay delta-neutral
+    4. Adjust spreads based on volatility and inventory
+    5. Dynamically manage leverage based on risk
+
     Features:
     - Post-only orders to earn maker rebates (0.003%)
-    - L2-aware spread adaptation based on book imbalance
-    - Inventory skew to rebalance positions
+    - Adaptive spread based on volatility
+    - Inventory-based quote skewing
     - Funding rate awareness
-    - Circuit breakers and quote fading
-    
+    - Circuit breakers for risk management
+
     Usage:
         config = Config.load()
         client = HyperliquidClient(config)
@@ -271,23 +224,23 @@ class MarketMakingStrategy:
     """
 
     # Fee structure (Hyperliquid)
-    MAKER_REBATE = 0.00003  # 0.003% rebate
-    TAKER_FEE = 0.00035  # 0.035% fee
-    
-    # Professional MM parameters
-    QUOTE_REFRESH_INTERVAL = 1.0  # 1s for HFT
-    MIN_ORDER_AGE_SECONDS = 5.0  # Cancel/replace orders older than 5s
-    MAX_BID_ORDERS = 15  # Reduced from 100 for concentrated liquidity
-    MAX_ASK_ORDERS = 15
-    MIN_BOOK_DEPTH_USD = 5000  # Minimum liquidity per side ($5K for US500)
-    ADVERSE_SELECTION_THRESHOLD = 3  # Consecutive losing fills trigger fading
+    MAKER_REBATE = 0.00003  # 0.003% rebate (3 bp credit, varies by tier)
+    TAKER_FEE = 0.00035  # 0.035% fee (can be lower with referral)
 
-    # Legacy parameters (maintained for compatibility)
-    PRICE_TOLERANCE_PCT = 0.0025
-    SIZE_TOLERANCE_PCT = 0.30
-    SKIP_UPDATE_IF_ALL_MATCHED = True
-    MIN_SECONDS_BETWEEN_UPDATES = 15.0
-    MAX_PENDING_CANCELS_BEFORE_BATCH = 3
+    # Order recycling thresholds (AGGRESSIVE - prevent unnecessary cancellations)
+    # At $90k BTC: 0.25% = $225 tolerance - wide enough to handle normal volatility
+    PRICE_TOLERANCE_PCT = 0.0025  # 0.25% - reuse order if within this range (~$225 at $90k)
+    SIZE_TOLERANCE_PCT = 0.30  # 30% - reuse if size within this range
+    MIN_ORDER_AGE_SECONDS = 30.0  # Don't replace orders younger than 30s
+
+    # Skip update thresholds (when to skip API calls entirely)
+    SKIP_UPDATE_IF_ALL_MATCHED = True  # If all orders recycled, skip update cycle
+    MIN_SECONDS_BETWEEN_UPDATES = 15.0  # Minimum 15 seconds between actual order updates
+    MAX_PENDING_CANCELS_BEFORE_BATCH = 3  # Only cancel if 3+ orders need it
+    
+    # FIFO Order Management - Maximum order limits
+    MAX_BID_ORDERS = 100  # Maximum 100 bid orders
+    MAX_ASK_ORDERS = 100  # Maximum 100 ask orders
 
     def __init__(self, config: Config, client: HyperliquidClient, risk_manager: RiskManager):
         """Initialize the strategy."""
@@ -301,8 +254,8 @@ class MarketMakingStrategy:
         self.inventory = InventoryState()
 
         # Real account tracking (from REST API, not WebSocket fills)
-        self.starting_equity: float = 1000.0  # HARDCODED: $1000 starting capital for performance tracking
-        self.current_equity: float = 1000.0  # Current equity ($1000 + realized PnL from fills)
+        self.starting_equity: float = config.trading.collateral  # Starting capital
+        self.current_equity: float = config.trading.collateral  # Current account value
         self.unrealized_pnl: float = 0.0  # Unrealized PnL from open positions
 
         # API call optimization metrics
@@ -319,12 +272,10 @@ class MarketMakingStrategy:
 
         # Price tracking
         self.price_buffer = CircularBuffer(500)
-        self.volatility_buffer = CircularBuffer(100)  # Track realized vol
         self.last_trade_price = 0.0
         self.funding_rate = 0.0
         self.last_orderbook: Optional[OrderBook] = None
         self.last_mid_price: float = 0.0
-        self.last_book_analysis: Optional[BookDepthAnalysis] = None  # L2 analysis
         self._cached_orderbook: Optional[OrderBook] = None
         self._orderbook_cache_time: float = 0.0
         self._orderbook_cache_ttl: float = 0.5  # Cache orderbook for 0.5 seconds
@@ -898,78 +849,7 @@ class MarketMakingStrategy:
             logger.error(f"Error in strategy iteration: {e}")
 
     async def _update_quotes(self, risk_metrics: RiskMetrics) -> None:
-        """
-        Update bid and ask quotes with L2 order book awareness.
-        
-        PROFESSIONAL MM APPROACH:
-        1. Analyze L2 book depth and imbalance
-        2. Calculate volatility-adaptive spread (min/max for tiering)
-        3. Check book liquidity before quoting
-        4. Build exponentially tiered quotes (concentrated near mid)
-        5. Apply inventory skew for delta-neutral operation
-        6. Handle one-sided quoting for extreme imbalance
-        """
-        # Check quote interval (1s for HFT)
-        now = time.time()
-        if now - self.last_quote_time < self.QUOTE_REFRESH_INTERVAL:
-            return
-
-        self.last_quote_time = now
-
-        # Get current orderbook
-        orderbook = await self._get_cached_orderbook()
-        if not orderbook or not orderbook.mid_price:
-            logger.warning("No orderbook available")
-            return
-        
-        # Update price buffer
-        self.price_buffer.append(orderbook.mid_price)
-        self.last_mid_price = orderbook.mid_price
-
-        # Analyze L2 book depth
-        self.last_book_analysis = self._analyze_order_book(orderbook)
-        
-        # Check if book is liquid enough
-        if not self.last_book_analysis.is_liquid:
-            logger.debug(f"Book depth: bids=${self.last_book_analysis.total_bid_depth:.0f}, asks=${self.last_book_analysis.total_ask_depth:.0f} (threshold: $5000)")
-            logger.warning("Book not liquid enough - cancelling quotes")
-            await self._cancel_all_quotes()
-            return
-
-        # Calculate adaptive spread (returns min/max for tiering)
-        min_spread_bps, max_spread_bps = self._calculate_spread(orderbook, risk_metrics)
-
-        # Calculate quote sizes
-        base_size = self.risk_manager.calculate_order_size(
-            orderbook.mid_price, "both", risk_metrics
-        )
-
-        if base_size <= 0:
-            # Risk too high, cancel existing quotes
-            await self._cancel_all_quotes()
-            return
-
-        # Build tiered quotes with exponential spread distribution
-        new_bids, new_asks = self._build_tiered_quotes(
-            orderbook, min_spread_bps, max_spread_bps, base_size
-        )
-        
-        # Handle one-sided quoting for extreme inventory imbalance (>2.5%)
-        if abs(self.inventory.delta) > 0.025:
-            if self.inventory.delta > 0:  # Long - only quote asks
-                new_bids = []
-                await self._cancel_all_side("buy")
-                logger.info(f"ONE-SIDED (asks only): delta={self.inventory.delta:.3f}")
-            else:  # Short - only quote bids
-                new_asks = []
-                await self._cancel_all_side("sell")
-                logger.info(f"ONE-SIDED (bids only): delta={self.inventory.delta:.3f}")
-
-        # Update orders
-        await self._update_orders(new_bids, new_asks)
-
-    async def _update_quotes_OLD(self, risk_metrics: RiskMetrics) -> None:
-        """OLD: Original grid-based quote update logic."""
+        """Update bid and ask quotes."""
         # Check quote interval
         now = time.time()
         if now - self.last_quote_time < self.quote_interval:
@@ -984,7 +864,7 @@ class MarketMakingStrategy:
             return
 
         # Calculate spread
-        spread_bps = self._calculate_spread_OLD(orderbook, risk_metrics)
+        spread_bps = self._calculate_spread(orderbook, risk_metrics)
 
         # Calculate quote prices with inventory skew
         bid_price, ask_price = self._calculate_quote_prices(orderbook, spread_bps, risk_metrics)
@@ -1069,294 +949,7 @@ class MarketMakingStrategy:
         # Update orders
         await self._update_orders(new_bids, new_asks)
 
-    def _analyze_order_book(self, orderbook: OrderBook) -> BookDepthAnalysis:
-        """
-        Analyze L2 order book depth and liquidity for professional market making.
-        
-        Returns comprehensive book analysis including:
-        - Total depth (top 10 levels)
-        - Imbalance and directional pressure
-        - Microprice (size-weighted mid)
-        - Liquidity concentration
-        """
-        analysis = BookDepthAnalysis()
-        
-        if not orderbook.bids or not orderbook.asks:
-            return analysis
-        
-        # Calculate total depth (top 10 levels for professional MM)
-        top_10_bids = orderbook.bids[:10]
-        top_10_asks = orderbook.asks[:10]
-        
-        analysis.total_bid_depth = sum(price * size for price, size in top_10_bids)
-        analysis.total_ask_depth = sum(price * size for price, size in top_10_asks)
-        
-        # Top 5 depth (concentration analysis)
-        analysis.top_5_bid_depth = sum(price * size for price, size in orderbook.bids[:5])
-        analysis.top_5_ask_depth = sum(price * size for price, size in orderbook.asks[:5])
-        
-        # Book imbalance (-1 to +1, positive = more bid pressure)
-        total_depth = analysis.total_bid_depth + analysis.total_ask_depth
-        if total_depth > 0:
-            analysis.imbalance = (analysis.total_bid_depth - analysis.total_ask_depth) / total_depth
-        
-        # Microprice (size-weighted mid for better fair value estimation)
-        if orderbook.best_bid and orderbook.best_ask:
-            best_bid_size = orderbook.best_bid_size or 0
-            best_ask_size = orderbook.best_ask_size or 0
-            total_size = best_bid_size + best_ask_size
-            
-            if total_size > 0:
-                analysis.weighted_mid = (
-                    orderbook.best_bid * best_ask_size + orderbook.best_ask * best_bid_size
-                ) / total_size
-            else:
-                analysis.weighted_mid = orderbook.mid_price or 0
-        
-        # Book pressure (directional force, scaled by depth)
-        analysis.book_pressure = analysis.imbalance * min(total_depth / 100000, 1.0)
-        
-        return analysis
-
-    def _calculate_inventory_skew(self) -> Tuple[float, float]:
-        """
-        Calculate quote skew factors based on inventory position.
-        
-        Returns (bid_skew_factor, ask_skew_factor) where:
-        - >1.0 = widen that side (discourage fills)
-        - <1.0 = tighten that side (encourage fills)
-        """
-        if abs(self.inventory.delta) < 0.005:  # Within 0.5%
-            return 1.0, 1.0
-        
-        # Linear skew up to 5% delta
-        urgency = self.inventory.skew_urgency
-        
-        if self.inventory.delta > 0:  # Long position - discourage more buys
-            bid_skew = 1.0 + urgency * 2.0  # Widen bids up to 3x
-            ask_skew = 1.0 - urgency * 0.3  # Tighten asks slightly
-        else:  # Short position - discourage more sells
-            bid_skew = 1.0 - urgency * 0.3  # Tighten bids
-            ask_skew = 1.0 + urgency * 2.0  # Widen asks up to 3x
-        
-        return max(bid_skew, 0.5), max(ask_skew, 0.5)
-
-    def _build_tiered_quotes(
-        self,
-        orderbook: OrderBook,
-        min_spread_bps: float,
-        max_spread_bps: float,
-        total_size: float
-    ) -> Tuple[List[QuoteLevel], List[QuoteLevel]]:
-        """
-        Build exponentially tiered quotes concentrated near mid price.
-        
-        PROFESSIONAL MM QUOTE DISTRIBUTION:
-        - Levels 1-5: 1-5 bps, 70% of volume (tight for high fill rate)
-        - Levels 6-10: 5-15 bps, 20% of volume (medium spread)
-        - Levels 11-15: 15-50 bps, 10% of volume (wide spread, tail risk)
-        
-        Uses exponential decay for sizing and exponential expansion for spreads.
-        """
-        logger.debug(f"_build_tiered_quotes called: min={min_spread_bps:.1f}, max={max_spread_bps:.1f}, size={total_size:.4f}")
-        logger.debug(f"Orderbook: mid={orderbook.mid_price}, best_bid={orderbook.best_bid}, best_ask={orderbook.best_ask}")
-        if not orderbook.mid_price or not orderbook.best_bid or not orderbook.best_ask:
-            logger.warning(f"_build_tiered_quotes: Missing orderbook data (mid={orderbook.mid_price}, bid={orderbook.best_bid}, ask={orderbook.best_ask}), returning empty")
-            return [], []
-        
-        mid = orderbook.mid_price
-        bids = []
-        asks = []
-        
-        # Get inventory skew factors
-        bid_skew, ask_skew = self._calculate_inventory_skew()
-        
-        # Number of levels (reduced to 12-15 for concentrated liquidity)
-        total_levels = min(self.MAX_BID_ORDERS, 12)
-        
-        # Size distribution: exponentially decreasing (70% in top 5 levels)
-        # CRITICAL FIX: Use total_size as BASE for first level, not total across all levels
-        # This ensures at least the first few levels meet minimum lot size
-        sizes = []
-        decay_factor = 0.9  # Exponential decay (0.9 for smoother distribution across 12 levels)
-        for i in range(total_levels):
-            level_size = total_size * (decay_factor ** i)
-            sizes.append(level_size)
-        
-        # NO normalization - let sizes decay naturally from base
-        # This way if total_size = 0.1, level 0 = 0.1, level 1 = 0.07, etc.
-        
-        # Spread distribution: exponential expansion from min to max
-        spreads = []
-        for i in range(total_levels):
-            t = i / (total_levels - 1) if total_levels > 1 else 0
-            spread_bps = min_spread_bps * (max_spread_bps / min_spread_bps) ** t
-            spreads.append(spread_bps)
-        
-        # Apply inventory skew to spreads
-        bid_spreads = [s * bid_skew for s in spreads]
-        ask_spreads = [s * ask_skew for s in spreads]
-        
-        # Build quote levels
-        tick_size = 1.0 if self.symbol == "BTC" else 0.01
-        lot_size = 0.0001 if self.symbol == "BTC" else 0.1
-        
-        logger.debug(f"Building {total_levels} levels: tick={tick_size}, lot={lot_size}, mid={mid:.2f}")
-        
-        for i in range(total_levels):
-            # Bid
-            bid_offset = mid * (bid_spreads[i] / 10000)
-            bid_price = round_price(mid - bid_offset, tick_size)
-            
-            # Ensure we don't cross the book
-            if orderbook.best_bid and bid_price >= orderbook.best_bid:
-                old_bid = bid_price
-                bid_price = round_price(orderbook.best_bid - tick_size, tick_size)
-                logger.debug(f"Level {i}: Bid crossed book! {old_bid:.2f} >= {orderbook.best_bid:.2f}, adjusted to {bid_price:.2f}")
-            
-            bid_size = round_size(sizes[i], lot_size)
-            if bid_size >= lot_size:
-                bids.append(QuoteLevel(
-                    price=bid_price,
-                    size=bid_size,
-                    side=OrderSide.BUY
-                ))
-            else:
-                logger.debug(f"Level {i}: Bid size too small: {bid_size:.4f} < {lot_size:.4f}")
-            
-            # Ask
-            ask_offset = mid * (ask_spreads[i] / 10000)
-            ask_price = round_price(mid + ask_offset, tick_size)
-            
-            # Ensure we don't cross the book
-            if orderbook.best_ask and ask_price <= orderbook.best_ask:
-                old_ask = ask_price
-                ask_price = round_price(orderbook.best_ask + tick_size, tick_size)
-                logger.debug(f"Level {i}: Ask crossed book! {old_ask:.2f} <= {orderbook.best_ask:.2f}, adjusted to {ask_price:.2f}")
-            
-            ask_size = round_size(sizes[i], lot_size)
-            if ask_size >= lot_size:
-                asks.append(QuoteLevel(
-                    price=ask_price,
-                    size=ask_size,
-                    side=OrderSide.SELL
-                ))
-            else:
-                logger.debug(f"Level {i}: Ask size too small: {ask_size:.4f} < {lot_size:.4f}")
-        
-        # Remove duplicates (same price levels)
-        bids = self._deduplicate_levels(bids)
-        asks = self._deduplicate_levels(asks)
-        
-        # Log summary (ALWAYS log, even if empty)
-        logger.debug(f"After building: {len(bids)} bids, {len(asks)} asks")
-        if bids and asks:
-            total_bid_notional = sum(l.price * l.size for l in bids)
-            total_ask_notional = sum(l.price * l.size for l in asks)
-            logger.debug(
-                f"Built {len(bids)} bids (${total_bid_notional:.0f}) + "
-                f"{len(asks)} asks (${total_ask_notional:.0f}) | "
-                f"Spreads: {min_spread_bps:.1f}-{max_spread_bps:.1f} bps | "
-                f"Skew: {bid_skew:.2f}/{ask_skew:.2f}"
-            )
-        else:
-            logger.warning(f"Empty quotes! bids={len(bids)}, asks={len(asks)}")
-        
-        return bids, asks
-
-    def _deduplicate_levels(self, levels: List[QuoteLevel]) -> List[QuoteLevel]:
-        """Remove duplicate price levels, keeping the largest size."""
-        if not levels:
-            return []
-        
-        by_price = {}
-        for level in levels:
-            if level.price not in by_price:
-                by_price[level.price] = level
-            else:
-                # Keep the larger size
-                if level.size > by_price[level.price].size:
-                    by_price[level.price] = level
-        
-        # Sort by price
-        result = sorted(by_price.values(), key=lambda x: x.price,
-                       reverse=(levels[0].side == OrderSide.BUY))
-        return result
-
-    def _calculate_spread(self, orderbook: OrderBook, risk_metrics: RiskMetrics) -> Tuple[float, float]:
-        """
-        Calculate volatility-adaptive spread for professional market making.
-        
-        PROFESSIONAL MM APPROACH (L2-aware):
-        - Base spread on realized volatility (1-50 bps range)
-        - Adjust for book imbalance (adverse selection risk)
-        - Widen on consecutive losing fills (quote fading)
-        - Tighten when book is deep and liquid
-        - Return (min_spread_bps, max_spread_bps) for exponential tiering
-        
-        Evolution from grid-based:
-        - Old: Fixed 1-50 bps grid, no book awareness
-        - New: Dynamic 1-50 bps based on vol, book depth, adverse selection
-        """
-        # Calculate realized volatility
-        prices = self.price_buffer.get_array()
-        if len(prices) >= 20:
-            returns = np.diff(np.log(prices[-60:]))  # Last 60 ticks
-            realized_vol = np.std(returns) * np.sqrt(252 * 24 * 60)  # Annualized
-            self.volatility_buffer.append(realized_vol)
-        else:
-            realized_vol = 0.10  # Default 10%
-        
-        # Base spread on volatility
-        if realized_vol < 0.08:  # Low vol (<8%)
-            min_spread = 1.0  # 1 bp
-            max_spread = 10.0
-        elif realized_vol < 0.15:  # Medium vol (8-15%)
-            min_spread = 2.0
-            max_spread = 20.0
-        elif realized_vol < 0.25:  # High vol (15-25%)
-            min_spread = 5.0
-            max_spread = 35.0
-        else:  # Very high vol (>25%)
-            min_spread = 10.0
-            max_spread = 50.0
-        
-        # Adjust for book conditions
-        if self.last_book_analysis:
-            # Widen if book is imbalanced (adverse selection risk)
-            if abs(self.last_book_analysis.imbalance) > 0.3:
-                min_spread *= 1.5
-                max_spread *= 1.3
-                logger.debug(f"Book imbalance {self.last_book_analysis.imbalance:.2f} - widening spreads")
-            
-            # Tighten if book is deep and liquid
-            if self.last_book_analysis.is_liquid:
-                min_spread *= 0.8
-                max_spread *= 0.9
-        
-        # Check for adverse selection (quote fading)
-        recent_spread = self.metrics.get_recent_spread_bps()
-        if recent_spread is not None and recent_spread < -2.0:
-            # Losing money - widen spreads
-            min_spread *= 2.0
-            max_spread *= 1.5
-            logger.warning(f"Adverse selection detected: {recent_spread:.2f} bps - widening spreads")
-        
-        # Quote fading on consecutive losing fills
-        if self.metrics.consecutive_losing_fills >= self.ADVERSE_SELECTION_THRESHOLD:
-            min_spread *= 2.5
-            max_spread *= 2.0
-            logger.warning(f"Quote fading: {self.metrics.consecutive_losing_fills} losing fills")
-        
-        # Ensure reasonable bounds
-        min_spread = max(min_spread, 1.0)  # At least 1 bp
-        max_spread = min(max_spread, 50.0)  # At most 50 bps
-        
-        logger.debug(f"Spread: {min_spread:.1f}-{max_spread:.1f} bps (vol={realized_vol:.2%})")
-        
-        return min_spread, max_spread
-
-    def _calculate_spread_OLD(self, orderbook: OrderBook, risk_metrics: RiskMetrics) -> float:
+    def _calculate_spread(self, orderbook: OrderBook, risk_metrics: RiskMetrics) -> float:
         """
         Calculate adaptive spread using IV-based calculation with numba.
 
@@ -1728,7 +1321,6 @@ class MarketMakingStrategy:
 
         This dramatically reduces API calls and rate limit usage.
         """
-        logger.debug(f"_update_orders called: {len(new_bids)} new bids, {len(new_asks)} new asks | Active: {len(self.active_bids)} bids, {len(self.active_asks)} asks")
         orders_to_cancel = []
         orders_to_place = []
         now = time.time()
@@ -2234,15 +1826,11 @@ class MarketMakingStrategy:
             self.inventory = InventoryState()
             self.unrealized_pnl = 0.0
 
-        # Fetch real account value from REST API for position tracking (NOT equity tracking)
+        # Fetch real account value from REST API for accurate PnL tracking
         account_state = await self.client.get_account_state()
         if account_state:
-            # HARDCODED EQUITY TRACKING: Use $1000 + realized PnL from trade_tracker
-            # This ensures performance metrics are based on $1000 starting capital
-            realized_pnl = self.trade_tracker.data.get("realized_pnl", 0.0)
-            self.current_equity = self.starting_equity + realized_pnl
-            
-            # Update metrics with PnL from $1000 base
+            self.current_equity = account_state.equity
+            # Update metrics with real PnL from account value
             self.metrics.net_pnl = self.current_equity - self.starting_equity
 
     def _on_orderbook_update(self, orderbook: OrderBook) -> None:

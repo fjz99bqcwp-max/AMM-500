@@ -93,6 +93,7 @@ class RiskState:
     total_loss_amount: float = 0.0
     last_check_time: float = 0.0
     consecutive_losses: int = 0
+    consecutive_losing_fills: int = 0  # NEW: Track adverse selection
     price_history: CircularBuffer = field(default_factory=lambda: CircularBuffer(1000))
 
     # STRESS-TEST tracking for x25
@@ -100,6 +101,11 @@ class RiskState:
     cumulative_funding_cost: float = 0.0  # Total funding paid
     last_funding_time: float = 0.0
     current_delta: float = 0.0  # Current position delta
+    
+    # ENHANCEMENT: Taker volume tracking
+    taker_volume_24h: float = 0.0  # Taker volume in last 24h
+    maker_volume_24h: float = 0.0  # Maker volume in last 24h
+    taker_ratio_threshold: float = 0.10  # Max 10% taker volume
 
 
 class RiskManager:
@@ -467,6 +473,61 @@ class RiskManager:
 
         return metrics
 
+    def check_taker_volume_ratio(self, metrics: RiskMetrics) -> bool:
+        """
+        Check if taker volume ratio is within acceptable limits.
+        
+        PROFESSIONAL MM SAFEGUARD:
+        - Target: >90% maker volume (earn rebates)
+        - Warning: <90% maker (some taker fills)
+        - Pause: <80% maker (excessive taker fills)
+        
+        Returns True if trading should be paused.
+        """
+        total_volume = self.state.taker_volume_24h + self.state.maker_volume_24h
+        if total_volume == 0:
+            return False
+        
+        taker_ratio = self.state.taker_volume_24h / total_volume
+        maker_ratio = 1.0 - taker_ratio
+        
+        if maker_ratio < 0.80:  # Less than 80% maker
+            logger.warning(
+                f"TAKER VOLUME TOO HIGH: {taker_ratio:.1%} taker, {maker_ratio:.1%} maker - "
+                "PAUSING to improve maker ratio"
+            )
+            metrics.should_pause_trading = True
+            return True
+        elif maker_ratio < 0.90:  # Less than 90% maker
+            logger.info(
+                f"Taker volume elevated: {taker_ratio:.1%} taker, {maker_ratio:.1%} maker"
+            )
+        
+        return False
+
+    def check_consecutive_losing_fills(self, consecutive_losses: int, metrics: RiskMetrics) -> None:
+        """
+        Check for consecutive losing fills (adverse selection).
+        
+        ENHANCEMENT: Auto-pause on 3 consecutive losing fills.
+        This indicates severe adverse selection or picking-off.
+        """
+        if consecutive_losses >= 3:
+            logger.warning(
+                f"CONSECUTIVE LOSING FILLS: {consecutive_losses} in a row - "
+                "Widening spreads and reducing activity"
+            )
+            # Don't pause immediately, but flag for spread widening
+            # The strategy layer will handle quote fading
+            metrics.should_reduce_exposure = True
+        
+        if consecutive_losses >= 5:
+            logger.error(
+                f"SEVERE ADVERSE SELECTION: {consecutive_losses} consecutive losses - "
+                "PAUSING trading temporarily"
+            )
+            metrics.should_pause_trading = True
+
     def _assess_risk_level(self, metrics: RiskMetrics, position: Optional[Position]) -> RiskMetrics:
         """Assess overall risk level and set recommendations."""
         risk_scores = []
@@ -653,14 +714,20 @@ class RiskManager:
         max_position_usd = self.config.trading.max_net_exposure
         max_size = max_position_usd / price if price > 0 else 0
 
-        # Minimum size floor based on symbol's szDecimals
-        # US500: szDecimals=1 -> minimum 0.1 contracts (~$69 at $693)
-        # BTC: szDecimals=4 -> minimum 0.0001 BTC (~$10 at $100k)
+        # Minimum size based on ORDER_SIZE_FRACTION for professional MM multi-level quoting
+        # Use ORDER_SIZE_FRACTION * collateral as base size per level
+        # For US500 with 0.3 fraction and $1000 collateral: $300 / $689 = 0.435 contracts
+        base_size_from_fraction = (self.config.trading.order_size_fraction * self.config.trading.collateral) / price if price > 0 else 0
+        
+        # Also respect symbol's minimum lot size
         symbol = self.config.trading.symbol.upper()
         if symbol == "US500":
-            min_size = 0.1  # szDecimals=1 -> 10^(-1) = 0.1 contracts
+            symbol_min_size = 0.1  # szDecimals=1 -> 10^(-1) = 0.1 contracts
         else:
-            min_size = max(0.00012, 10.0 / price) if price > 0 else 0.00012  # Ensures $10+ notional
+            symbol_min_size = max(0.00012, 10.0 / price) if price > 0 else 0.00012  # Ensures $10+ notional
+        
+        # Use the larger of fraction-based or symbol minimum
+        min_size = max(base_size_from_fraction, symbol_min_size)
 
         final_size = max(min_size, min(kelly_size, max_size))
         

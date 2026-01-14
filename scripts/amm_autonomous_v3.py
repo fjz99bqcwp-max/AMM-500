@@ -191,12 +191,22 @@ class WalletTracker:
         self.info = Info(hl_constants.MAINNET_API_URL, skip_ws=True)
         self.state_history: deque = deque(maxlen=100)
         self.peak_equity = 0.0
-        self.session_start_equity = 0.0
+        self.session_start_equity = 1000.0  # Hardcoded starting capital
+        self.realized_pnl = 0.0  # Track cumulative realized PnL from fills
         self._initialized = False
+    
+    def update_equity_from_fills(self, realized_pnl: float):
+        """Update equity based on realized PnL from fills."""
+        self.realized_pnl += realized_pnl
     
     def get_wallet_state(self) -> WalletState:
         """Fetch current wallet state from API."""
         try:
+            # HARDCODED: Always start cycle 0 with $1000, track performance via trading data
+            if not self._initialized:
+                log("INFO", "🎯 Starting cycle 0 with $1000 hardcoded capital")
+                self._initialized = True
+            
             # Get user state (includes equity, positions, margin)
             user_state = self.info.user_state(self.wallet_address)
             
@@ -206,7 +216,11 @@ class WalletTracker:
             
             # Parse cross-margin summary
             cross = user_state.get("crossMarginSummary", {})
-            equity = float(cross.get("accountValue", 0))
+            
+            # Calculate equity: $1000 base + realized PnL from fills
+            # This ensures metrics are always based on $1000 starting capital
+            equity = self.session_start_equity + self.realized_pnl
+            
             margin_used = float(cross.get("totalMarginUsed", 0))
             available_margin = float(cross.get("withdrawable", 0))
             
@@ -242,12 +256,7 @@ class WalletTracker:
             )
             
             # Track peak equity for drawdown
-            if not self._initialized:
-                self.session_start_equity = equity
-                self.peak_equity = equity
-                self._initialized = True
-            else:
-                self.peak_equity = max(self.peak_equity, equity)
+            self.peak_equity = max(self.peak_equity, equity)
             
             self.state_history.append(state)
             return state
@@ -830,10 +839,13 @@ class PerformanceMonitorV3:
             fills = self.get_fills()
             trade_update = self.update_trade_metrics(fills)
             
+            # Update wallet tracker with realized PnL from fills
             if trade_update["new_trades"] > 0:
+                self.wallet_tracker.update_equity_from_fills(trade_update["cycle_pnl"])
                 log("INFO", f"   New trades: {trade_update['new_trades']}")
                 log("INFO", f"   Cycle PnL: ${trade_update['cycle_pnl']:+.4f}")
                 log("INFO", f"   Session PnL (trades): ${self.trade_metrics.session_pnl:+.2f}")
+                log("INFO", f"   Updated equity: ${self.wallet_tracker.session_start_equity + self.wallet_tracker.realized_pnl:.2f}")
             else:
                 log("INFO", "   No new trades")
             
