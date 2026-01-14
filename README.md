@@ -326,7 +326,10 @@ The `amm_autonomous_v3.py` script provides 24/7 monitoring with:
 
 **Start monitoring:**
 ```bash
+source .venv/bin/activate
 python scripts/amm_autonomous_v3.py
+
+pkill -f "amm_autonomous_v3"
 ```
 
 **Check logs:**

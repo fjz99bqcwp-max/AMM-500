@@ -640,11 +640,12 @@ class PerformanceMonitorV3:
                 with open(STATE_FILE) as f:
                     state = json.load(f)
                 
-                self.cycle_count = state.get("cycle_count", 0)
+                # Always reset cycle_count to 0 on restart
+                self.cycle_count = 0
                 self.trade_metrics.total_trades = state.get("total_trades", 0)
                 self.processed_fills = set(state.get("processed_fills", [])[-500:])
                 
-                log("INFO", f"Loaded state: {self.cycle_count} cycles, {self.trade_metrics.total_trades} trades")
+                log("INFO", f"State loaded (cycle reset to 0), {self.trade_metrics.total_trades} total trades")
         except Exception as e:
             log("WARN", f"Could not load state: {e}")
     
