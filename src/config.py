@@ -214,13 +214,13 @@ class Config:
             session_public_key=get_env("SESSION_PUBLIC_KEY") or None,
             trading=TradingConfig(
                 symbol=get_env("SYMBOL", "US500"),  # Default to US500
-                leverage=get_env_int("LEVERAGE", 20),  # 20x default for index
-                max_net_exposure=get_env_float("MAX_NET_EXPOSURE", 25000.0),
+                leverage=get_env_int("LEVERAGE", 5),  # 5x default for safer operation (reduced from 20x)
+                max_net_exposure=get_env_float("MAX_NET_EXPOSURE", 5000.0),  # Reduced from 25000
                 collateral=get_env_float("COLLATERAL", 1000.0),
-                min_spread_bps=get_env_float("MIN_SPREAD_BPS", 1.0),  # 1 bp min for US500
+                min_spread_bps=get_env_float("MIN_SPREAD_BPS", 3.0),  # 3 bp min for US500 (increased from 1bp for profitability)
                 max_spread_bps=get_env_float("MAX_SPREAD_BPS", 50.0),
-                order_size_fraction=get_env_float("ORDER_SIZE_FRACTION", 0.02),
-                order_levels=get_env_int("ORDER_LEVELS", 20),
+                order_size_fraction=get_env_float("ORDER_SIZE_FRACTION", 0.01),  # Reduced from 0.02 to 0.01 (1% per order)
+                order_levels=get_env_int("ORDER_LEVELS", 5),  # Reduced from 20 to 5 levels for better control
             ),
             risk=RiskConfig(
                 max_drawdown=get_env_float("MAX_DRAWDOWN", 0.05),
@@ -232,11 +232,11 @@ class Config:
                 funding_rate_hedge_threshold=get_env_float(
                     "FUNDING_RATE_HEDGE_THRESHOLD", 0.00015
                 ),
-                inventory_skew_threshold=get_env_float("INVENTORY_SKEW_THRESHOLD", 0.015),
+                inventory_skew_threshold=get_env_float("INVENTORY_SKEW_THRESHOLD", 0.005),  # Reduced from 0.015 (1.5%) to 0.005 (0.5%)
             ),
             execution=ExecutionConfig(
-                rebalance_interval=get_env_float("REBALANCE_INTERVAL", 3.0),
-                quote_refresh_interval=get_env_float("QUOTE_REFRESH_INTERVAL", 1.0),
+                rebalance_interval=get_env_float("REBALANCE_INTERVAL", 10.0),  # Increased from 3s to 10s to reduce overtrading
+                quote_refresh_interval=get_env_float("QUOTE_REFRESH_INTERVAL", 3.0),  # Increased from 1s to 3s
                 max_orders_per_batch=get_env_int("MAX_ORDERS_PER_BATCH", 40),
                 target_actions_per_day=get_env_int("TARGET_ACTIONS_PER_DAY", 15000),
                 paper_trading=get_env_bool("PAPER_TRADING", False),

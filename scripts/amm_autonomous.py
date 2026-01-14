@@ -23,19 +23,29 @@ import subprocess
 import sys
 import os
 import json
-import asyncio
+# import asyncio  # Not needed without data collector
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Import US500 data collector
-from src.us500_data_collector import get_collector
+# Import US500 data collector - DISABLED to prevent blocking
+# from src.us500_data_collector import get_collector
 
 # Load credentials from .env
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / "config" / ".env")
+
+# Signed API imports DISABLED - no longer needed for trade-only tracking
+# try:
+#     from hyperliquid.info import Info
+#     from hyperliquid.utils import constants
+#     from eth_account import Account
+#     SIGNED_API_AVAILABLE = True
+# except ImportError:
+#     SIGNED_API_AVAILABLE = False
+SIGNED_API_AVAILABLE = False  # Disabled - using trade-only performance tracking
 
 # User wallet for real-time data validation (funded wallet)
 WALLET = os.getenv("WALLET_ADDRESS", "0x1cCC14E273DEF02EF2BF62B9bb6B6cAa15805f9C")
@@ -87,11 +97,11 @@ class PerformanceMonitor:
         self.last_fill_time = 0  # Track last fill timestamp for new trade detection
         self.total_trades_seen = set()  # Track unique fills by hash
 
-        # Balance tracking for optimization
-        self.starting_balance: float = 0.0
-        self.last_balance: float = 0.0
-        self.balance_history: List[Dict] = []  # Track balance over time
-        self.session_pnl: float = 0.0  # PnL since monitor started
+        # Trade-based performance tracking (no balance dependency)
+        self.session_trades: List[Dict] = []  # All trades since session start
+        self.cumulative_pnl: float = 0.0  # Realized PnL from matched trades
+        self.total_fees_paid: float = 0.0  # Total fees paid
+        self.session_start_time: float = time.time() * 1000  # Session start in ms
 
         self.load_state()
 
@@ -104,13 +114,13 @@ class PerformanceMonitor:
                     self.cycle_count = state.get("cycle_count", 0)
                     self.bot_restarts = state.get("bot_restarts", 0)
                     self.last_fill_time = state.get("last_fill_time", 0)
-                    self.starting_balance = state.get("starting_balance", 0.0)
-                    self.last_balance = state.get("last_balance", 0.0)
-                    self.balance_history = state.get("balance_history", [])
-                    self.session_pnl = state.get("session_pnl", 0.0)
+                    self.session_trades = state.get("session_trades", [])
+                    self.cumulative_pnl = state.get("cumulative_pnl", 0.0)
+                    self.total_fees_paid = state.get("total_fees_paid", 0.0)
+                    self.session_start_time = state.get("session_start_time", time.time() * 1000)
                     log(
                         "INFO",
-                        f"Loaded state: {self.cycle_count} cycles, {self.bot_restarts} restarts",
+                        f"Loaded state: {self.cycle_count} cycles, {self.bot_restarts} restarts, PnL ${self.cumulative_pnl:+.2f}",
                     )
         except Exception as e:
             log("WARN", f"Could not load state: {e}")
@@ -124,10 +134,10 @@ class PerformanceMonitor:
                 "last_fill_time": self.last_fill_time,
                 "last_cycle": datetime.now().isoformat(),
                 "performance_history": self.performance_history[-50:],  # Keep last 50
-                "starting_balance": self.starting_balance,
-                "last_balance": self.last_balance,
-                "balance_history": self.balance_history[-100:],  # Keep last 100
-                "session_pnl": self.session_pnl,
+                "session_trades": self.session_trades[-500:],  # Keep last 500 trades
+                "cumulative_pnl": self.cumulative_pnl,
+                "total_fees_paid": self.total_fees_paid,
+                "session_start_time": self.session_start_time,
             }
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             with open(STATE_FILE, "w") as f:
@@ -189,125 +199,105 @@ class PerformanceMonitor:
 
         return None
 
-    def get_perp_balance(self, account_state: Optional[Dict]) -> Optional[Dict]:
-        """Extract perpetual balance info from account state."""
-        if not account_state:
-            return None
-
+    def calculate_trade_pnl(self, fills: List[Dict]) -> Dict:
+        """Calculate PnL from matched buy/sell trades."""
         try:
-            margin_summary = account_state.get("marginSummary", {})
-
-            # Key balance metrics
-            account_value = float(margin_summary.get("accountValue", 0))
-            total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
-            total_ntl_pos = float(margin_summary.get("totalNtlPos", 0))
-
-            # For HIP-3 perps (US500), check Spot USDH balance as primary balance
-            # USDH in Spot is used as margin for HIP-3 perps
-            spot_usdh = 0.0
-            if SYMBOL.upper() == "US500":
-                try:
-                    spot_resp = requests.post(URL, json={"type": "spotClearinghouseState", "user": WALLET}, timeout=10)
-                    spot_state = spot_resp.json()
-                    for b in spot_state.get("balances", []):
-                        if b.get("coin") == "USDH":
-                            spot_usdh = float(b.get("total", 0))
-                            break
-                    
-                    # For US500, use Spot USDH as the primary balance source
-                    if spot_usdh > 0:
-                        log("DEBUG", f"HIP-3: Using ${spot_usdh:.2f} USDH from Spot as account value")
-                        account_value = spot_usdh
-                        
-                except Exception as e:
-                    log("DEBUG", f"Could not check Spot USDH: {e}")
-
-            # Get position info - for HIP-3 perps, coin format is km:SYMBOL
-            asset_positions = account_state.get("assetPositions", [])
-            position_size = 0.0
-            unrealized_pnl = 0.0
-            entry_px = 0.0
-            liquidation_px = 0.0
-
-            # Check for km:US500 (HIP-3 format) or US500 (regular format)
-            target_coins = [f"km:{SYMBOL}", SYMBOL] if SYMBOL.upper() == "US500" else [SYMBOL]
+            # Separate buys and sells
+            buys = [f for f in fills if f.get('side') == 'B']
+            sells = [f for f in fills if f.get('side') == 'S']
             
-            for pos in asset_positions:
-                pos_info = pos.get("position", {})
-                coin = pos_info.get("coin", "")
-                if coin in target_coins:  # Check both formats
-                    position_size = float(pos_info.get("szi", 0))
-                    unrealized_pnl = float(pos_info.get("unrealizedPnl", 0))
-                    entry_px = float(pos_info.get("entryPx", 0))
-                    liquidation_px = float(pos_info.get("liquidationPx", 0) or 0)
-
+            # Calculate volumes and average prices
+            buy_volume = sum(float(f.get('sz', 0)) for f in buys)
+            sell_volume = sum(float(f.get('sz', 0)) for f in sells)
+            
+            buy_notional = sum(float(f.get('sz', 0)) * float(f.get('px', 0)) for f in buys)
+            sell_notional = sum(float(f.get('sz', 0)) * float(f.get('px', 0)) for f in sells)
+            
+            avg_buy_px = buy_notional / buy_volume if buy_volume > 0 else 0
+            avg_sell_px = sell_notional / sell_volume if sell_volume > 0 else 0
+            
+            # Calculate fees
+            total_fees = sum(abs(float(f.get('fee', 0))) for f in fills)
+            
+            # Calculate PnL (matched volume * spread - fees)
+            matched_volume = min(buy_volume, sell_volume)
+            spread_capture = (avg_sell_px - avg_buy_px) * matched_volume
+            net_pnl = spread_capture - total_fees
+            
+            # Calculate spread in bps
+            mid_px = (avg_buy_px + avg_sell_px) / 2 if avg_buy_px > 0 and avg_sell_px > 0 else 0
+            spread_bps = (avg_sell_px - avg_buy_px) / mid_px * 10000 if mid_px > 0 else 0
+            
             return {
-                "equity": account_value,
-                "margin_used": total_margin_used,
-                "position_notional": total_ntl_pos,
-                "position_size": position_size,
-                "unrealized_pnl": unrealized_pnl,
-                "entry_price": entry_px,
-                "liquidation_price": liquidation_px,
+                "total_fills": len(fills),
+                "buys": len(buys),
+                "sells": len(sells),
+                "buy_volume": buy_volume,
+                "sell_volume": sell_volume,
+                "avg_buy_px": avg_buy_px,
+                "avg_sell_px": avg_sell_px,
+                "spread_bps": spread_bps,
+                "spread_capture": spread_capture,
+                "total_fees": total_fees,
+                "net_pnl": net_pnl,
+                "matched_volume": matched_volume,
+                "imbalance": abs(buy_volume - sell_volume)
             }
         except Exception as e:
-            log("ERROR", f"Failed to parse balance: {e}")
-            return None
+            log("ERROR", f"Failed to calculate trade PnL: {e}")
+            return {"total_fills": 0, "net_pnl": 0, "total_fees": 0}
 
-    def update_balance_tracking(self, balance_info: Dict) -> Dict:
-        """Update balance tracking and calculate session PnL."""
-        if not balance_info:
-            return {"error": "No balance info"}
+    def update_trade_tracking(self, fills: List[Dict]) -> Dict:
+        """Update trade tracking and calculate cumulative PnL from trades only."""
+        if not fills:
+            return {"error": "No fills provided", "session_pnl": self.cumulative_pnl, "total_fees": self.total_fees_paid}
 
-        equity = balance_info["equity"]
-        timestamp = datetime.now().isoformat()
-
-        # Initialize starting balance on first run
-        if self.starting_balance == 0:
-            self.starting_balance = equity
-            log("INFO", f"💰 Starting balance set: ${equity:.2f}")
-
-        # Calculate changes
-        cycle_change = equity - self.last_balance if self.last_balance > 0 else 0
-        session_change = equity - self.starting_balance
-        session_pct = (
-            (session_change / self.starting_balance * 100) if self.starting_balance > 0 else 0
-        )
-
-        # Update session PnL
-        self.session_pnl = session_change
-
-        # Track balance history
-        self.balance_history.append(
-            {
-                "timestamp": timestamp,
-                "cycle": self.cycle_count,
-                "equity": equity,
-                "cycle_change": cycle_change,
-                "session_pnl": session_change,
-                "position_size": balance_info.get("position_size", 0),
-                "unrealized_pnl": balance_info.get("unrealized_pnl", 0),
-            }
-        )
-
-        # Update last balance
-        prev_balance = self.last_balance
-        self.last_balance = equity
-
+        # Filter to session trades only (since session start)
+        session_fills = [f for f in fills if f.get('time', 0) >= self.session_start_time]
+        
+        # Store session trades
+        self.session_trades = session_fills
+        
+        # Calculate PnL from trade data
+        trade_pnl = self.calculate_trade_pnl(session_fills)
+        
+        # Update cumulative metrics
+        self.cumulative_pnl = trade_pnl.get('net_pnl', 0)
+        self.total_fees_paid = trade_pnl.get('total_fees', 0)
+        
+        # Calculate cycle metrics (since last check)
+        recent_fills = [f for f in fills if f.get('time', 0) > self.last_fill_time]
+        cycle_pnl_data = self.calculate_trade_pnl(recent_fills) if recent_fills else {"net_pnl": 0}
+        
         return {
-            "equity": equity,
-            "prev_equity": prev_balance,
-            "cycle_pnl": cycle_change,
-            "session_pnl": session_change,
-            "session_pnl_pct": session_pct,
-            "position_size": balance_info.get("position_size", 0),
-            "unrealized_pnl": balance_info.get("unrealized_pnl", 0),
+            "session_fills": len(session_fills),
+            "total_buys": trade_pnl.get('buys', 0),
+            "total_sells": trade_pnl.get('sells', 0),
+            "buy_volume": trade_pnl.get('buy_volume', 0),
+            "sell_volume": trade_pnl.get('sell_volume', 0),
+            "avg_buy_px": trade_pnl.get('avg_buy_px', 0),
+            "avg_sell_px": trade_pnl.get('avg_sell_px', 0),
+            "spread_bps": trade_pnl.get('spread_bps', 0),
+            "spread_capture": trade_pnl.get('spread_capture', 0),
+            "session_pnl": self.cumulative_pnl,
+            "total_fees": self.total_fees_paid,
+            "cycle_pnl": cycle_pnl_data.get('net_pnl', 0),
+            "matched_volume": trade_pnl.get('matched_volume', 0),
+            "imbalance": trade_pnl.get('imbalance', 0),
         }
 
     def get_fills(self, limit: int = 2000) -> List[Dict]:
-        """Fetch recent fills - using max API limit for accuracy."""
+        """Fetch recent fills - using HIP-3 compatible API for accuracy."""
         try:
-            resp = requests.post(URL, json={"type": "userFills", "user": WALLET}, timeout=10)
+            # HIP-3 specific API call with perp_dexs
+            payload = {
+                "type": "userFillsByTime", 
+                "user": WALLET,
+                "startTime": int((time.time() - 3600*24*7) * 1000),  # Last 7 days
+                "endTime": int(time.time() * 1000),
+                "perp_dexs": ["km"]  # HIP-3 specific
+            }
+            resp = requests.post(URL, json=payload, timeout=10)
             resp.raise_for_status()
             fills = resp.json()
 
@@ -497,70 +487,74 @@ class PerformanceMonitor:
 
         return issues
 
-    def detect_errors(self, account_state: Optional[Dict]) -> List[str]:
-        """Detect errors in account state or execution."""
+    def detect_errors(self, account_state: Optional[Dict], trade_update: Dict = None) -> List[str]:
+        """Detect errors from trade data and position info (no balance checks)."""
         errors = []
 
         if not account_state:
             errors.append("CRITICAL: Cannot fetch account state")
             return errors
 
-        # Check for position issues
-        margin_summary = account_state.get("marginSummary", {})
-        account_value = float(margin_summary.get("accountValue", 0))
-
-        if account_value < 900:  # Started with $1000
-            errors.append(f"DRAWDOWN WARNING: Account value ${account_value:.2f} (< $900)")
-
-        # Check for stuck positions
+        # Check for stuck positions from account state
         asset_positions = account_state.get("assetPositions", [])
         for pos in asset_positions:
             position_value = abs(float(pos.get("position", {}).get("szi", 0)))
-            if position_value > 0.01:  # Large position
+            if position_value > 0.5:  # Significant position
                 errors.append(f"LARGE POSITION: {position_value:.5f} {SYMBOL}")
+
+        # Check for excessive imbalance from trade data
+        if trade_update and "imbalance" in trade_update:
+            imbalance = trade_update["imbalance"]
+            total_vol = trade_update.get("buy_volume", 0) + trade_update.get("sell_volume", 0)
+            if total_vol > 0 and imbalance / total_vol > 0.8:  # 80%+ imbalance
+                errors.append(f"TRADE IMBALANCE: {imbalance:.2f} contracts ({imbalance/total_vol*100:.0f}% of volume)")
+
+        # Check for negative session PnL
+        if trade_update and "session_pnl" in trade_update:
+            session_pnl = trade_update["session_pnl"]
+            if session_pnl < -5.0:  # $5+ loss
+                errors.append(f"NEGATIVE SESSION PnL: ${session_pnl:+.2f}")
 
         return errors
 
     def optimize_strategy(
-        self, analysis: Dict, issues: List[str], balance_update: Dict = None
+        self, analysis: Dict, issues: List[str], trade_update: Dict = None
     ) -> Optional[Dict]:
-        """Determine optimization needs autonomously using real balance data."""
+        """Determine optimization needs using trade-based performance data only."""
         optimizations = {}
 
         spread_bps = analysis.get("spread_bps", 0)
         net_pnl = analysis.get("net_pnl_estimate", 0)
         total_fees = analysis.get("total_fees", 0)
 
-        # Use REAL balance data for optimization decisions
+        # Use TRADE data for optimization decisions (no balance dependency)
         cycle_pnl = 0.0
         session_pnl = 0.0
-        session_pnl_pct = 0.0
-        equity = 0.0
+        session_fills = 0
 
-        if balance_update and "equity" in balance_update:
-            cycle_pnl = balance_update.get("cycle_pnl", 0)
-            session_pnl = balance_update.get("session_pnl", 0)
-            session_pnl_pct = balance_update.get("session_pnl_pct", 0)
-            equity = balance_update.get("equity", 0)
+        if trade_update and "session_pnl" in trade_update:
+            cycle_pnl = trade_update.get("cycle_pnl", 0)
+            session_pnl = trade_update.get("session_pnl", 0)
+            session_fills = trade_update.get("session_fills", 0)
 
         # Check for adverse selection
         adverse_selection = any("ADVERSE SELECTION" in issue for issue in issues)
 
-        # Calculate recent balance trend (last 5 cycles)
+        # Calculate recent PnL trend from performance history
         recent_pnl_trend = 0.0
-        if len(self.balance_history) >= 5:
-            recent_changes = [h.get("cycle_change", 0) for h in self.balance_history[-5:]]
-            recent_pnl_trend = sum(recent_changes)
+        if len(self.performance_history) >= 5:
+            recent_pnls = [h.get("net_pnl", 0) for h in self.performance_history[-5:]]
+            recent_pnl_trend = sum(recent_pnls)
 
-        # OPT#17: Enhanced adaptive modes with aggressive for >+10 bps
-        # Priority: Balance-based decisions over spread-based
-        if session_pnl_pct < -0.5 or (cycle_pnl < -0.50 and recent_pnl_trend < -1.0):
-            # Real money loss detected - emergency defensive
+        # OPT#17: Enhanced adaptive modes with trade-based decisions
+        # Priority: Trade PnL decisions over spread-based
+        if session_pnl < -2.0 or (cycle_pnl < -0.50 and recent_pnl_trend < -1.0):
+            # Significant loss detected - emergency defensive
             optimizations["mode"] = "EMERGENCY_DEFENSIVE"
             optimizations["defensive_distance"] = 10.0
             optimizations["order_levels"] = 1
             optimizations["reason"] = (
-                f"REAL LOSS: cycle=${cycle_pnl:+.2f}, session=${session_pnl:+.2f} ({session_pnl_pct:+.2f}%)"
+                f"REAL LOSS: cycle=${cycle_pnl:+.2f}, session=${session_pnl:+.2f}"
             )
             optimizations["urgency"] = "CRITICAL"
         elif adverse_selection or spread_bps < -3.0 or cycle_pnl < -0.20:  # Tighter threshold
@@ -604,11 +598,10 @@ class PerformanceMonitor:
             )
             optimizations["urgency"] = "LOW"
 
-        # Add balance metrics to optimization
-        optimizations["equity"] = equity
+        # Add trade metrics to optimization (no balance data)
+        optimizations["session_fills"] = session_fills
         optimizations["cycle_pnl"] = cycle_pnl
         optimizations["session_pnl"] = session_pnl
-        optimizations["session_pnl_pct"] = session_pnl_pct
 
         # Additional warnings
         warnings = []
@@ -664,6 +657,125 @@ class PerformanceMonitor:
 
         time.sleep(5)
 
+    def get_open_orders(self):
+        """Get current open orders from the exchange."""
+        try:
+            response = requests.post(URL, json={
+                "type": "openOrders",
+                "user": WALLET
+            }, timeout=10)
+            if response.status_code == 200:
+                return response.json() if response.json() else []
+            else:
+                log("ERROR", f"Failed to fetch open orders: HTTP {response.status_code}")
+                return []
+        except Exception as e:
+            log("ERROR", f"Failed to fetch open orders: {e}")
+            return []
+    
+    def log_order_book_state(self, orders):
+        """Log detailed order book state with fills and cancellations."""
+        if not orders:
+            log("ORDER", "📋 No open orders")
+            return
+            
+        # Group orders by side
+        buy_orders = [o for o in orders if o.get('side') == 'B' and o.get('coin') == SYMBOL]
+        sell_orders = [o for o in orders if o.get('side') == 'A' and o.get('coin') == SYMBOL]
+        
+        log("ORDER", f"📋 OPEN ORDERS: {len(buy_orders)} buys, {len(sell_orders)} sells")
+        
+        # Log buy orders (highest to lowest)
+        if buy_orders:
+            buy_orders.sort(key=lambda x: float(x.get('limitPx', 0)), reverse=True)
+            log("ORDER", "🟢 BUY ORDERS:")
+            for i, order in enumerate(buy_orders):
+                price = float(order.get('limitPx', 0))
+                size = float(order.get('sz', 0))
+                filled = float(order.get('szFilled', 0))
+                remaining = size - filled
+                oid = order.get('oid', 'N/A')
+                timestamp = datetime.fromtimestamp(order.get('timestamp', 0) / 1000).strftime('%H:%M:%S') if order.get('timestamp') else 'N/A'
+                
+                fill_status = ""
+                if filled > 0:
+                    fill_pct = (filled / size) * 100 if size > 0 else 0
+                    fill_status = f" (filled {filled}/{size}, {fill_pct:.0f}%)"
+                
+                log("ORDER", f"  [{timestamp}] ${price:,.2f} × {remaining:.2f} | ID: {oid}{fill_status}")
+        
+        # Log sell orders (lowest to highest) 
+        if sell_orders:
+            sell_orders.sort(key=lambda x: float(x.get('limitPx', 0)))
+            log("ORDER", "🔴 SELL ORDERS:")
+            for i, order in enumerate(sell_orders):
+                price = float(order.get('limitPx', 0))
+                size = float(order.get('sz', 0))
+                filled = float(order.get('szFilled', 0))
+                remaining = size - filled
+                oid = order.get('oid', 'N/A')
+                timestamp = datetime.fromtimestamp(order.get('timestamp', 0) / 1000).strftime('%H:%M:%S') if order.get('timestamp') else 'N/A'
+                
+                fill_status = ""
+                if filled > 0:
+                    fill_pct = (filled / size) * 100 if size > 0 else 0
+                    fill_status = f" (filled {filled}/{size}, {fill_pct:.0f}%)"
+                
+                log("ORDER", f"  [{timestamp}] ${price:,.2f} × {remaining:.2f} | ID: {oid}{fill_status}")
+
+    def track_order_changes(self, current_orders):
+        """Track and log order changes including fills and cancellations."""
+        if not hasattr(self, 'previous_orders'):
+            self.previous_orders = {}
+            return
+            
+        # Convert current orders to dict keyed by order ID
+        current_dict = {o.get('oid', 'unknown'): o for o in current_orders if o.get('coin') == SYMBOL}
+        
+        # Check for filled or cancelled orders
+        for prev_oid, prev_order in self.previous_orders.items():
+            if prev_oid not in current_dict:
+                # Order was filled or cancelled
+                side = "BUY" if prev_order.get('side') == 'B' else "SELL"
+                price = float(prev_order.get('limitPx', 0))
+                size = float(prev_order.get('sz', 0))
+                filled = float(prev_order.get('szFilled', 0))
+                
+                if filled == size:
+                    log("ORDER", f"✅ FULLY FILLED: {side} {size:.2f} @ ${price:,.2f} | ID: {prev_oid}")
+                elif filled > 0:
+                    remaining = size - filled
+                    log("ORDER", f"⚠️ PARTIALLY FILLED + CANCELLED: {side} {filled:.2f}/{size:.2f} @ ${price:,.2f} | ID: {prev_oid}")
+                else:
+                    log("ORDER", f"❌ CANCELLED: {side} {size:.2f} @ ${price:,.2f} | ID: {prev_oid}")
+        
+        # Check for partial fills on existing orders
+        for curr_oid, curr_order in current_dict.items():
+            if curr_oid in self.previous_orders:
+                prev_filled = float(self.previous_orders[curr_oid].get('szFilled', 0))
+                curr_filled = float(curr_order.get('szFilled', 0))
+                
+                if curr_filled > prev_filled:
+                    fill_amount = curr_filled - prev_filled
+                    side = "BUY" if curr_order.get('side') == 'B' else "SELL"
+                    price = float(curr_order.get('limitPx', 0))
+                    size = float(curr_order.get('sz', 0))
+                    
+                    log("ORDER", f"🎯 PARTIAL FILL: {side} {fill_amount:.2f} @ ${price:,.2f} | ID: {curr_oid} ({curr_filled:.2f}/{size:.2f} filled)")
+        
+        # Check for new orders
+        for curr_oid, curr_order in current_dict.items():
+            if curr_oid not in self.previous_orders:
+                side = "BUY" if curr_order.get('side') == 'B' else "SELL"
+                price = float(curr_order.get('limitPx', 0))
+                size = float(curr_order.get('sz', 0))
+                timestamp = datetime.fromtimestamp(curr_order.get('timestamp', 0) / 1000).strftime('%H:%M:%S') if curr_order.get('timestamp') else 'N/A'
+                
+                log("ORDER", f"🆕 NEW ORDER: {side} {size:.2f} @ ${price:,.2f} | ID: {curr_oid} [{timestamp}]")
+        
+        # Update tracking
+        self.previous_orders = current_dict.copy()
+
     def monitor_cycle(self):
         """Execute one monitoring cycle with direct Hyperliquid data."""
         self.cycle_count += 1
@@ -674,44 +786,56 @@ class PerformanceMonitor:
         print("=" * 80)
 
         # 1. Fetch data directly from Hyperliquid
-        log("INFO", "📊 Fetching account data from Hyperliquid...")
-        account_state = self.get_account_state()
+        log("INFO", "📊 Fetching trade data from Hyperliquid...")
+        account_state = self.get_account_state()  # Still needed for position info
         fills = self.get_fills(2000)  # Fetch max available data
 
-        # 2. Fetch and track perpetual balance
-        balance_info = self.get_perp_balance(account_state)
-        balance_update = self.update_balance_tracking(balance_info) if balance_info else {}
+        # 2. Calculate performance from trade data only (no balance queries)
+        trade_update = self.update_trade_tracking(fills)
 
-        # Log balance info
-        if balance_info:
-            equity = balance_info["equity"]
-            position = balance_info["position_size"]
-            unrealized = balance_info["unrealized_pnl"]
-            cycle_pnl = balance_update.get("cycle_pnl", 0)
-            session_pnl = balance_update.get("session_pnl", 0)
-            session_pct = balance_update.get("session_pnl_pct", 0)
+        # Log trade-based performance metrics
+        if "error" not in trade_update:
+            session_pnl = trade_update["session_pnl"]
+            total_fees = trade_update["total_fees"]
+            cycle_pnl = trade_update["cycle_pnl"]
+            spread_bps = trade_update["spread_bps"]
+            buys = trade_update["total_buys"]
+            sells = trade_update["total_sells"]
+            buy_vol = trade_update["buy_volume"]
+            sell_vol = trade_update["sell_volume"]
+            imbalance = trade_update["imbalance"]
 
+            # Show comprehensive trade-based performance
             log(
                 "DATA",
-                f"💰 Equity: ${equity:.2f} | Position: {position:+.4f} {SYMBOL} | Unrealized: ${unrealized:+.2f}",
+                f"📊 Session Stats: {trade_update['session_fills']} fills | {buys} buys ({buy_vol:.2f}) / {sells} sells ({sell_vol:.2f}) | Imbalance: {imbalance:.2f}",
+            )
+            log(
+                "DATA",
+                f"💰 Session PnL: ${session_pnl:+.4f} | Spread: {spread_bps:+.2f} bps | Fees: ${total_fees:.4f}",
             )
             if self.cycle_count > 1:
                 pnl_emoji = "📈" if cycle_pnl >= 0 else "📉"
                 log(
                     "DATA",
-                    f"{pnl_emoji} Cycle PnL: ${cycle_pnl:+.4f} | Session PnL: ${session_pnl:+.2f} ({session_pct:+.2f}%)",
+                    f"{pnl_emoji} Cycle PnL: ${cycle_pnl:+.4f}",
                 )
         else:
-            log("WARN", "⚠️  Could not fetch balance")
+            log("WARN", f"⚠️  {trade_update.get('error', 'Could not calculate trade metrics')}")
 
         if not fills:
             log("WARN", "⚠️  No fills yet - bot may be starting up")
             return
 
-        # Count new trades using timestamp-based detection
-        # Each fill has a unique time+side+px+sz combination
+        # 3. Track and log open orders
+        log("INFO", "📋 Fetching and tracking open orders...")
+        current_orders = self.get_open_orders()
+        self.track_order_changes(current_orders)
+        self.log_order_book_state(current_orders)
+
+        # Count new trades using timestamp-based detection with detailed logging
         current_fill_hashes = set()
-        new_trades = 0
+        new_trades = []
         latest_fill_time = 0
 
         for f in fills:
@@ -719,23 +843,62 @@ class PerformanceMonitor:
                 f"{f.get('time', 0)}_{f.get('side', '')}_{f.get('px', '')}_{f.get('sz', '')}"
             )
             current_fill_hashes.add(fill_hash)
-            fill_time = f.get("time", 0)
+            fill_time = f.get('time', 0)
             if fill_time > latest_fill_time:
                 latest_fill_time = fill_time
             # Count fills newer than our last recorded fill time
             if fill_time > self.last_fill_time:
-                new_trades += 1
+                new_trades.append(f)
+
+        # Log new trades in detail
+        if new_trades:
+            buys = [f for f in new_trades if f.get('side') == 'B']
+            sells = [f for f in new_trades if f.get('side') == 'A']
+            
+            log("FILL", f"🆕 {len(new_trades)} NEW FILLS: {len(buys)} buys, {len(sells)} sells")
+            
+            # Calculate total volume and fees for new fills
+            new_volume = sum(float(f.get('sz', 0)) for f in new_trades)
+            new_fees = sum(float(f.get('fee', 0)) for f in new_trades)
+            
+            # Show recent fills with side, time, price, size, and fees
+            for i, f in enumerate(new_trades[-15:]):  # Show last 15 new fills
+                side = "BUY " if f.get('side') == 'B' else "SELL"
+                timestamp = datetime.fromtimestamp(f.get('time', 0) / 1000).strftime('%H:%M:%S')
+                price = f.get('px', 0)
+                size = f.get('sz', 0)
+                fee = f.get('fee', 0)
+                notional = float(price) * float(size)
+                
+                log("FILL", f"  [{timestamp}] {side} {size} @ ${price} | ${notional:.2f} notional | fee ${fee}")
+                
+            # Calculate spread on new trades if we have both sides
+            if buys and sells:
+                new_buy_avg = sum(float(f.get('px', 0)) * float(f.get('sz', 0)) for f in buys) / sum(float(f.get('sz', 0)) for f in buys)
+                new_sell_avg = sum(float(f.get('px', 0)) * float(f.get('sz', 0)) for f in sells) / sum(float(f.get('sz', 0)) for f in sells)
+                new_spread = new_sell_avg - new_buy_avg
+                new_spread_bps = (new_spread / ((new_buy_avg + new_sell_avg)/2)) * 10000 if new_buy_avg > 0 else 0
+                
+                spread_status = "✅ PROFITABLE" if new_spread_bps > 0 else "❌ ADVERSE"
+                log("FILL", f"  📊 New fills spread: ${new_spread:.2f} ({new_spread_bps:+.1f} bps) {spread_status}")
+                
+            log("FILL", f"  📈 New volume: {new_volume:.2f} contracts | Total fees: ${new_fees:.4f}")
+            
+        else:
+            log("INFO", "No new fills since last cycle")
 
         # Update tracking
         if latest_fill_time > self.last_fill_time:
             self.last_fill_time = latest_fill_time
         self.trade_count = len(fills)
 
-        log("INFO", f"Total fills: {len(fills)} (new since last cycle: {new_trades})")
+        log("INFO", f"📊 Total fills: {len(fills)} (new: {len(new_trades)})")
 
-        # 2. Analyze performance with weighted averages
+        # 2. Analyze performance with weighted averages and multiple windows
         log("INFO", "📈 Analyzing performance (weighted by size)...")
         analysis_30m = self.analyze_recent_performance(fills, 30)
+        analysis_5m = self.analyze_recent_performance(fills, 5)
+        analysis_1h = self.analyze_recent_performance(fills, 60)
 
         # Initialize variables with defaults
         spread_bps = 0
@@ -751,23 +914,38 @@ class PerformanceMonitor:
             profitable = analysis_30m.get("profitable", False)
             status = "✅" if profitable else "❌"
 
-            log("DATA", f"30-min window: {analysis_30m['total_fills']} fills")
-            log("DATA", f"Spread: {spread_bps:+.2f} bps {status}")
+            log("DATA", f"📊 30-min window: {analysis_30m['total_fills']} fills")
+            log("DATA", f"📈 Spread captured: {spread_bps:+.2f} bps {status}")
 
             # OPT#17: Add adverse selection count and fills rate/hour
             adverse_count = analysis_30m.get("adverse_selection_count", 0)
             fills_per_hour = analysis_30m.get("fills_per_hour", 0)
             log(
                 "DATA",
-                f"Adverse Selection: {adverse_count} instances | Fill Rate: {fills_per_hour:.1f} fills/hour",
+                f"⚠️  Adverse selection: {adverse_count} periods | 🔄 Fill rate: {fills_per_hour:.1f}/hour",
             )
+            
+            # Add 5-minute recent analysis for immediate feedback
+            if "error" not in analysis_5m:
+                recent_spread = analysis_5m.get("spread_bps", 0)
+                recent_fills = analysis_5m.get("total_fills", 0)
+                recent_status = "✅" if recent_spread > 0 else "❌"
+                log("DATA", f"🕐 Last 5min: {recent_fills} fills, {recent_spread:+.2f} bps {recent_status}")
+            
+            # Add 1-hour trend analysis
+            if "error" not in analysis_1h:
+                hourly_spread = analysis_1h.get("spread_bps", 0)
+                hourly_fills = analysis_1h.get("total_fills", 0)
+                hourly_pnl = analysis_1h.get("net_pnl_estimate", 0)
+                trend_emoji = "📈" if hourly_spread > 0 else "📉"
+                log("DATA", f"{trend_emoji} 1-hour trend: {hourly_fills} fills, {hourly_spread:+.2f} bps, PnL ${hourly_pnl:+.2f}")
 
             log(
                 "DATA",
-                f"Net PnL: ${net_pnl:+.4f} | Fees: ${total_fees:.4f} | Volume: {volume_btc:.6f} BTC",
+                f"💰 Net PnL: ${net_pnl:+.4f} | Fees: ${total_fees:.4f} | Volume: {volume_btc:.2f} contracts",
             )
-            log("DATA", f"Buys: {analysis_30m['buys']} @ ${analysis_30m.get('avg_buy', 0):,.2f}")
-            log("DATA", f"Sells: {analysis_30m['sells']} @ ${analysis_30m.get('avg_sell', 0):,.2f}")
+            log("DATA", f"📊 Buys: {analysis_30m['buys']} @ ${analysis_30m.get('avg_buy', 0):,.2f} avg")
+            log("DATA", f"📊 Sells: {analysis_30m['sells']} @ ${analysis_30m.get('avg_sell', 0):,.2f} avg")
         else:
             log("WARN", f"{analysis_30m.get('error')}")
             analysis_30m = {}
@@ -784,7 +962,7 @@ class PerformanceMonitor:
 
         # 4. Detect errors
         log("INFO", "🔍 Detecting errors...")
-        errors = self.detect_errors(account_state)
+        errors = self.detect_errors(account_state, trade_update)
 
         if errors:
             for error in errors:
@@ -792,10 +970,10 @@ class PerformanceMonitor:
         else:
             log("INFO", "✅ No errors detected")
 
-        # 5. Apply optimizations AUTONOMOUSLY (using real balance data)
-        log("INFO", "⚙️  Evaluating optimization needs (using real balance)...")
+        # 5. Apply optimizations AUTONOMOUSLY (using trade data only)
+        log("INFO", "⚙️  Evaluating optimization needs (trade-based)...")
         optimization = self.optimize_strategy(
-            analysis_30m, strategy_issues + errors, balance_update
+            analysis_30m, strategy_issues + errors, trade_update
         )
 
         if optimization:
@@ -804,7 +982,6 @@ class PerformanceMonitor:
             urgency = optimization.get("urgency", "LOW")
             cycle_pnl = optimization.get("cycle_pnl", 0)
             session_pnl = optimization.get("session_pnl", 0)
-            session_pnl_pct = optimization.get("session_pnl_pct", 0)
 
             if urgency == "CRITICAL":
                 log("OPTIM", f"🚨 EMERGENCY OPTIMIZATION: {mode} MODE")
@@ -829,8 +1006,7 @@ class PerformanceMonitor:
                     "net_pnl": net_pnl,
                     "cycle_pnl": cycle_pnl,
                     "session_pnl": session_pnl,
-                    "session_pnl_pct": session_pnl_pct,
-                    "equity": optimization.get("equity", 0),
+                    "session_fills": optimization.get("session_fills", 0),
                     "mode": mode,
                     "urgency": urgency,
                 }
@@ -863,20 +1039,21 @@ class PerformanceMonitor:
         print("=" * 80)
         log("DATA", f"Cycle: #{self.cycle_count}")
         log("DATA", f"Total trades monitored: {self.trade_count}")
-        log("DATA", f"New trades this cycle: {new_trades}")
+        log("DATA", f"New trades this cycle: {len(new_trades) if 'new_trades' in locals() else 0}")
         log("DATA", f"Issues detected: {len(strategy_issues + errors)}")
 
-        # Balance summary (REAL DATA)
-        if balance_update and "equity" in balance_update:
-            equity = balance_update.get("equity", 0)
-            cycle_pnl = balance_update.get("cycle_pnl", 0)
-            session_pnl = balance_update.get("session_pnl", 0)
-            session_pct = balance_update.get("session_pnl_pct", 0)
+        # Trade-based performance summary (no balance data)
+        if trade_update and "session_pnl" in trade_update:
+            cycle_pnl = trade_update.get("cycle_pnl", 0)
+            session_pnl = trade_update.get("session_pnl", 0)
+            session_fills = trade_update.get("session_fills", 0)
+            total_fees = trade_update.get("total_fees", 0)
             pnl_emoji = "📈" if session_pnl >= 0 else "📉"
-            log("DATA", f"💰 Equity: ${equity:.2f}")
+            
+            log("DATA", f"💰 Session fills: {session_fills} trades")
             log(
                 "DATA",
-                f"{pnl_emoji} Cycle PnL: ${cycle_pnl:+.4f} | Session: ${session_pnl:+.2f} ({session_pct:+.2f}%)",
+                f"{pnl_emoji} Cycle PnL: ${cycle_pnl:+.4f} | Session: ${session_pnl:+.2f} | Fees: ${total_fees:.4f}",
             )
 
         # Performance summary with key metrics
@@ -893,11 +1070,14 @@ class PerformanceMonitor:
 
 def main():
     """Main monitoring loop with autonomous operation."""
+    print("DEBUG: main() starting...", flush=True)
+    
     monitor = PerformanceMonitor()
+    print("DEBUG: PerformanceMonitor created", flush=True)
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 80, flush=True)
     log("INFO", "🚀 CONTINUOUS MONITORING & AUTO-OPTIMIZATION SYSTEM v2.0")
-    print("=" * 80)
+    print("=" * 80, flush=True)
     log("INFO", f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log("INFO", f"Symbol: {SYMBOL} (S&P 500 Index Perpetual)")
     log("INFO", "Bot: OPT#14 (Adaptive Anti-Picking-Off) + Weighted Averages")
@@ -908,24 +1088,28 @@ def main():
     log("INFO", "Press Ctrl+C to stop")
     print("=" * 80)
 
-    # Start US500 candle collection in background
-    collector = get_collector()
-    collection_task = None
-    loop = None
-    
-    try:
-        # Start async collection in background thread
-        import threading
-        def run_collection():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(collector.collect_continuously())
-        
-        collection_thread = threading.Thread(target=run_collection, daemon=True)
-        collection_thread.start()
-        log("INFO", f"✅ Started {SYMBOL} candle collection (1-minute interval)")
-    except Exception as e:
-        log("WARN", f"Could not start candle collection: {e}")
+    # Candle collection disabled to avoid blocking monitoring
+    # Start US500 candle collection in background (optional, non-blocking)
+    # try:
+    #     collector = get_collector()
+    #     # Start async collection in background thread
+    #     import threading
+    #     def run_collection():
+    #         try:
+    #             loop = asyncio.new_event_loop()
+    #             asyncio.set_event_loop(loop)
+    #             loop.run_until_complete(collector.collect_continuously())
+    #         except Exception as e:
+    #             log("WARN", f"Candle collection error (non-critical): {e}")
+    #     
+    #     collection_thread = threading.Thread(target=run_collection, daemon=True)
+    #     collection_thread.start()
+    #     time.sleep(1)  # Give it a second to start
+    #     log("INFO", f"✅ Started {SYMBOL} candle collection (1-minute interval)")
+    # except Exception as e:
+    #     log("WARN", f"Could not start candle collection (non-critical): {e}")
+
+    log("INFO", "Starting monitoring cycles...")
 
     cycle_interval = 300  # 5 minutes between cycles
     trades_per_cycle_target = 10

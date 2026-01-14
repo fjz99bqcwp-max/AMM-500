@@ -188,10 +188,11 @@ class OrderBook:
 class AccountState:
     """Account state structure."""
 
-    equity: float
-    available_balance: float
+    equity: float  # Total balance (including held funds)
+    available_balance: float  # Available for new orders (equity - hold)
     margin_used: float
     unrealized_pnl: float
+    hold_balance: float = 0.0  # Funds held by open orders
     positions: List[Position] = field(default_factory=list)
     open_orders: List[Order] = field(default_factory=list)
 
@@ -204,6 +205,11 @@ class AccountState:
     @property
     def net_exposure(self) -> float:
         return sum(p.size * p.mark_price for p in self.positions)
+    
+    @property
+    def total_balance(self) -> float:
+        """Total balance including held funds - use for equity tracking."""
+        return self.equity
 
 
 class HyperliquidClient:
@@ -912,6 +918,10 @@ class HyperliquidClient:
 
             latency = self._order_latency.stop()
             logger.debug(f"Batch of {len(orders_data)} orders placed (latency: {latency:.1f}ms)")
+            
+            # Debug: Log full result for HIP-3 troubleshooting
+            if requests and requests[0].symbol.upper() == "US500":
+                logger.debug(f"HIP-3 order result: {result}")
 
             # Parse results
             orders = []
@@ -927,6 +937,16 @@ class HyperliquidClient:
                     logger.info(
                         f"Order batch result: {resting_count} resting, {filled_count} filled, {failed_count} failed"
                     )
+                    # Debug: Log actual order IDs
+                    for i, s in enumerate(statuses):
+                        if s.get("resting"):
+                            oid = s["resting"].get("oid", "?")
+                            logger.debug(f"  Order {i}: OID={oid} RESTING")
+                        elif s.get("filled"):
+                            oid = s["filled"].get("oid", "?")
+                            logger.debug(f"  Order {i}: OID={oid} FILLED")
+                        else:
+                            logger.debug(f"  Order {i}: FAILED - {s}")
 
                 # Extract BBO from failed ALO orders and update internal orderbook
                 # Error format: "Post only order would have immediately matched, bbo was 90901@90902. asset=0"
@@ -1622,7 +1642,7 @@ class HyperliquidClient:
                         )
                     )
 
-            # Parse open orders
+            # Parse open orders from user_state (works for main perps)
             open_orders = []
             for order_data in user_state.get("openOrders", []):
                 open_orders.append(
@@ -1636,6 +1656,30 @@ class HyperliquidClient:
                         timestamp=order_data.get("timestamp", 0),
                     )
                 )
+            
+            # For HIP-3 perps (km:US500), user_state.openOrders doesn't include HIP-3 orders
+            # We need to fetch them separately via info.open_orders() which uses the perp_dexs
+            if self.config.trading.symbol.upper() == "US500":
+                try:
+                    hip3_orders = self._info.open_orders(self.config.wallet_address)
+                    target_coin = f"km:{self.config.trading.symbol}"
+                    for order_data in hip3_orders:
+                        if order_data.get("coin") == target_coin:
+                            open_orders.append(
+                                Order(
+                                    order_id=str(order_data.get("oid", "")),
+                                    symbol=self.config.trading.symbol,  # Store as "US500" not "km:US500"
+                                    side=OrderSide.BUY if order_data.get("side") == "B" else OrderSide.SELL,
+                                    size=float(order_data.get("sz", 0)),
+                                    price=float(order_data.get("limitPx", 0)),
+                                    status="open",
+                                    timestamp=order_data.get("timestamp", 0),
+                                )
+                            )
+                    if hip3_orders:
+                        logger.debug(f"HIP-3: Fetched {len([o for o in hip3_orders if o.get('coin') == target_coin])} orders from km:US500")
+                except Exception as e:
+                    logger.warning(f"Could not fetch HIP-3 open orders: {e}")
 
             # Update local cache
             perps_equity = float(margin.get("accountValue", 0))
@@ -1643,27 +1687,40 @@ class HyperliquidClient:
             
             # For HIP-3 perps (km:US500), also check Spot USDH balance
             # USDH in Spot can be used as margin for HIP-3 perps
-            spot_usdh = 0.0
+            spot_usdh_total = 0.0
+            spot_usdh_hold = 0.0
             if self.config.trading.symbol.upper() == "US500":
                 try:
                     spot_state = self._info.spot_user_state(self.config.wallet_address)
                     for b in spot_state.get("balances", []):
                         if b.get("coin") == "USDH":
-                            spot_usdh = float(b.get("total", 0))
+                            spot_usdh_total = float(b.get("total", 0))  # Total including held
+                            spot_usdh_hold = float(b.get("hold", 0))   # Held by open orders
                             break
-                    if spot_usdh > 0 and perps_equity == 0:
-                        logger.info(f"HIP-3: Found ${spot_usdh:.2f} USDH in Spot (usable as margin)")
+                    if spot_usdh_total > 0:
+                        logger.debug(f"HIP-3: USDH total=${spot_usdh_total:.2f}, hold=${spot_usdh_hold:.2f}, available=${spot_usdh_total - spot_usdh_hold:.2f}")
                 except Exception as e:
                     logger.debug(f"Could not check Spot USDH: {e}")
             
-            # Use Spot USDH as equity if no Perps balance (HIP-3 uses Spot USDH as margin)
-            total_equity = perps_equity + spot_usdh
-            total_available = perps_available + spot_usdh
+            # For US500 isolated trading: Use PERP ACCOUNT EQUITY directly
+            # This is the actual balance that can be used for trading
+            # Spot USDH is separate and not directly usable for perp margin
+            if self.config.trading.symbol.upper() == "US500":
+                # US500 (km:US500) uses isolated margin - perp account equity is the CORRECT balance
+                total_equity = perps_equity  # Use perp account equity directly
+                total_available = perps_available  # Use perp available balance
+                if spot_usdh_total > 0:
+                    logger.debug(f"US500: Using perp equity ${perps_equity:.2f}, spot USDH ${spot_usdh_total:.2f} (reference only)")
+            else:
+                # For other symbols that might use cross-margin
+                total_equity = perps_equity + spot_usdh_total
+                total_available = perps_available + (spot_usdh_total - spot_usdh_hold)
             
             self._account_state = AccountState(
-                equity=total_equity,
-                available_balance=total_available,
+                equity=total_equity,  # Use PERP ACCOUNT EQUITY for isolated US500 trading
+                available_balance=total_available,  # Available for new orders
                 margin_used=float(margin.get("totalMarginUsed", 0)),
+                hold_balance=spot_usdh_hold,  # Track held amount
                 unrealized_pnl=float(margin.get("totalUnrealizedPnl", 0)),
                 positions=positions,
                 open_orders=open_orders,

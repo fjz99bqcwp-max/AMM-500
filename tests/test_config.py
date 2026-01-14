@@ -26,11 +26,11 @@ class TestTradingConfig:
         """Test default trading configuration."""
         config = TradingConfig()
 
-        assert config.symbol == "BTC"
-        assert config.leverage == 5  # Conservative default for low DD
-        assert config.max_net_exposure == 250000.0
+        assert config.symbol == "US500"  # Updated for US500 trading
+        assert config.leverage == 10  # Default for US500 (max 25x)
+        assert config.max_net_exposure == 25000.0  # Updated for US500
         assert config.collateral == 1000.0
-        assert config.order_levels == 18  # Balanced market making
+        assert config.order_levels == 20  # Updated for US500 market making
 
     def test_custom_values(self):
         """Test custom trading configuration."""

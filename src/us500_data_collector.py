@@ -119,7 +119,7 @@ class US500DataCollector:
                     candle['close'],
                     candle['volume']
                 ])
-            logger.debug(f"Saved US500 candle: {datetime.fromtimestamp(candle['timestamp']/1000)}")
+            # Debug log removed - candles saved silently
         except Exception as e:
             logger.error(f"Failed to save candle: {e}")
     

@@ -9,6 +9,7 @@ before using real funds. Past performance does not guarantee future results.
 
 import asyncio
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
@@ -204,6 +205,10 @@ class MarketMakingStrategy:
     SKIP_UPDATE_IF_ALL_MATCHED = True  # If all orders recycled, skip update cycle
     MIN_SECONDS_BETWEEN_UPDATES = 15.0  # Minimum 15 seconds between actual order updates
     MAX_PENDING_CANCELS_BEFORE_BATCH = 3  # Only cancel if 3+ orders need it
+    
+    # FIFO Order Management - Maximum order limits
+    MAX_BID_ORDERS = 100  # Maximum 100 bid orders
+    MAX_ASK_ORDERS = 100  # Maximum 100 ask orders
 
     def __init__(self, config: Config, client: HyperliquidClient, risk_manager: RiskManager):
         """Initialize the strategy."""
@@ -229,9 +234,9 @@ class MarketMakingStrategy:
             "order_syncs": 0,
         }
 
-        # Active quotes
-        self.active_bids: Dict[str, QuoteLevel] = {}
-        self.active_asks: Dict[str, QuoteLevel] = {}
+        # Active quotes - OrderedDict for FIFO order management
+        self.active_bids: OrderedDict[str, QuoteLevel] = OrderedDict()
+        self.active_asks: OrderedDict[str, QuoteLevel] = OrderedDict()
 
         # Price tracking
         self.price_buffer = CircularBuffer(500)
@@ -297,8 +302,11 @@ class MarketMakingStrategy:
             # Initialize risk manager
             await self.risk_manager.initialize()
 
-            # Cancel any existing orders
+            # Cancel any existing orders and clear local tracking
             await self.client.cancel_all_orders(self.symbol)
+            self.active_bids.clear()
+            self.active_asks.clear()
+            logger.info("Cleared local order tracking on startup")
 
             # Load initial state
             await self._refresh_inventory()
@@ -365,28 +373,118 @@ class MarketMakingStrategy:
         """
         Synchronize locally tracked active orders with exchange reality.
 
-        OPTIMIZATION: Only sync when we detect potential discrepancies through:
-        - Fill events that should have removed orders
-        - Long periods without order updates
-        - Explicit discrepancies found
-
-        This reduces API calls from every 60s to only when needed.
+        For HIP-3 perps (km:US500), the standard openOrders API returns 0.
+        We must use orderStatus by OID to verify individual orders.
         """
         now = time.time()
 
-        # Only sync if we haven't had a successful order update in 5+ minutes
-        # or if we suspect stale tracking (no updates in 10+ minutes)
-        time_since_last_update = now - getattr(self, "_last_actual_update", 0)
-        should_sync = time_since_last_update > 300.0  # 5 minutes
+        # AGGRESSIVE SYNC: Check every 30 seconds if we think we have orders
+        # This is critical for HIP-3 where orders get filled quickly
+        time_since_last_sync = now - getattr(self, "_last_order_sync", 0)
+        have_tracked_orders = len(self.active_bids) > 0 or len(self.active_asks) > 0
+        should_sync = have_tracked_orders and time_since_last_sync > 30.0
 
         if not should_sync:
             return
 
+        self._last_order_sync = now
         logger.debug("Performing order synchronization check")
         self._api_call_metrics["order_syncs"] += 1
 
         try:
-            # Get actual open orders from exchange
+            is_hip3 = self.symbol.upper() == 'US500'
+            
+            if is_hip3:
+                # HIP-3: Use openOrders API to get ground truth
+                import requests
+                from eth_account import Account
+                
+                try:
+                    # CRITICAL FIX: Query orders from the actual signing wallet, not WALLET_ADDRESS
+                    # The PRIVATE_KEY derives to the API wallet, so orders are placed from there
+                    signing_wallet = Account.from_key(self.config.private_key)
+                    query_address = signing_wallet.address
+                    
+                    logger.debug(f"Querying openOrders for signing wallet: {query_address}")
+                    
+                    resp = requests.post("https://api.hyperliquid.xyz/info", json={
+                        "type": "openOrders",
+                        "user": query_address  # Query the API wallet, not the main wallet
+                    }, timeout=10)
+                    open_orders = resp.json()
+                    
+                    # DEBUG: Log what openOrders returns
+                    logger.debug(f"HIP-3 openOrders response: {len(open_orders)} orders")
+                    if open_orders:
+                        logger.debug(f"Sample order: {open_orders[0]}")
+                    
+                    # Build set of actual open order IDs
+                    # Note: coin field might be "km:US500" or just "US500"
+                    target_symbols = [f'km:{self.symbol}', self.symbol.upper()]
+                    exchange_order_ids = {
+                        str(order.get('oid')) 
+                        for order in open_orders 
+                        if order.get('coin') in target_symbols
+                    }
+                    
+                    # Find stale orders (tracked locally but not on exchange)
+                    all_tracked_oids = set(self.active_bids.keys()) | set(self.active_asks.keys())
+                    stale_orders = all_tracked_oids - exchange_order_ids
+                    
+                    if stale_orders:
+                        logger.warning(f"HIP-3 order sync: Found {len(stale_orders)} phantom orders (tracked locally but not on exchange)")
+                        logger.debug(f"Tracked OIDs: {all_tracked_oids}")
+                        logger.debug(f"Exchange OIDs: {exchange_order_ids}")
+                        for oid in stale_orders:
+                            self.active_bids.pop(oid, None)
+                            self.active_asks.pop(oid, None)
+                    
+                    # Check for orphaned orders (on exchange but not tracked)
+                    orphaned = exchange_order_ids - all_tracked_oids
+                    if orphaned:
+                        logger.warning(f"HIP-3 order sync: Found {len(orphaned)} orphaned orders (on exchange but not tracked locally)")
+                        # Could add them to tracking, but safer to cancel and replace
+                    
+                    logger.debug(f"HIP-3 order sync complete: {len(self.active_bids)} bids, {len(self.active_asks)} asks tracked | {len(exchange_order_ids)} total on exchange")
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"HIP-3 openOrders API failed: {e}, falling back to orderStatus checks")
+                    # Fallback to orderStatus checks...
+                    stale_orders = []
+                    all_tracked_oids = list(self.active_bids.keys()) + list(self.active_asks.keys())
+                    
+                    for oid in all_tracked_oids:
+                        try:
+                            resp = requests.post("https://api.hyperliquid.xyz/info", json={
+                                "type": "orderStatus",
+                                "user": self.config.wallet_address,
+                                "oid": int(oid)
+                            }, timeout=5)
+                            data = resp.json()
+                            
+                            if data.get("status") != "order":
+                                stale_orders.append(oid)
+                            else:
+                                order = data.get("order", {}).get("order", {})
+                                status = order.get("orderStatus", "")
+                                if status in ["filled", "canceled", "cancelled"]:
+                                    stale_orders.append(oid)
+                        except Exception as e2:
+                            logger.debug(f"Error checking order {oid}: {e2}")
+                            # Assume stale if we can't verify
+                            stale_orders.append(oid)
+                    
+                    if stale_orders:
+                        logger.info(f"HIP-3 fallback sync: Removing {len(stale_orders)} unverifiable orders")
+                        for oid in stale_orders:
+                            self.active_bids.pop(oid, None)
+                            self.active_asks.pop(oid, None)
+                    
+                    logger.debug(f"HIP-3 fallback sync complete: {len(self.active_bids)} bids, {len(self.active_asks)} asks")
+                    return
+            
+            # Standard perps: Use open_orders API
             from hyperliquid.info import Info
             from hyperliquid.utils import constants as C
 
@@ -407,7 +505,9 @@ class MarketMakingStrategy:
             # Build set of actual open order IDs from exchange
             exchange_order_ids = set()
             for order in open_orders:
-                if order.get("coin") == self.symbol.replace("/", ""):  # BTC for BTC/USD
+                coin = order.get("coin", "")
+                symbol_match = coin == self.symbol.replace("/", "")
+                if symbol_match:
                     exchange_order_ids.add(str(order.get("oid", "")))
 
             # Check for orders we're tracking locally but not on exchange
@@ -444,6 +544,43 @@ class MarketMakingStrategy:
             logger.error(f"Error during order synchronization: {e}")
             # Don't clear orders on sync failure - better to keep potentially stale orders
             # than to lose all tracking due to a temporary API issue
+
+    async def _enforce_order_limits(self) -> None:
+        """
+        Enforce FIFO order limits - cancel oldest orders if limits exceeded.
+        
+        Limits: 100 bids max, 100 asks max (200 total)
+        When limit reached, cancels oldest orders first (FIFO).
+        """
+        orders_to_cancel = []
+        
+        # Check bid orders
+        if len(self.active_bids) > self.MAX_BID_ORDERS:
+            excess_bids = len(self.active_bids) - self.MAX_BID_ORDERS
+            logger.warning(f"Bid limit exceeded: {len(self.active_bids)}/{self.MAX_BID_ORDERS}, canceling {excess_bids} oldest bids")
+            
+            # Get oldest orders (OrderedDict maintains insertion order)
+            oldest_bid_oids = list(self.active_bids.keys())[:excess_bids]
+            for oid in oldest_bid_oids:
+                orders_to_cancel.append((self.symbol, oid))
+                del self.active_bids[oid]
+        
+        # Check ask orders
+        if len(self.active_asks) > self.MAX_ASK_ORDERS:
+            excess_asks = len(self.active_asks) - self.MAX_ASK_ORDERS
+            logger.warning(f"Ask limit exceeded: {len(self.active_asks)}/{self.MAX_ASK_ORDERS}, canceling {excess_asks} oldest asks")
+            
+            # Get oldest orders (OrderedDict maintains insertion order)
+            oldest_ask_oids = list(self.active_asks.keys())[:excess_asks]
+            for oid in oldest_ask_oids:
+                orders_to_cancel.append((self.symbol, oid))
+                del self.active_asks[oid]
+        
+        # Cancel excess orders
+        if orders_to_cancel:
+            logger.info(f"FIFO enforcement: Canceling {len(orders_to_cancel)} oldest orders (limit: 100 bids + 100 asks)")
+            await self.client.cancel_orders_batch(orders_to_cancel)
+            self.metrics.quotes_cancelled += len(orders_to_cancel)
 
     async def _sync_recent_fills(self) -> None:
         """
@@ -794,8 +931,8 @@ class MarketMakingStrategy:
         delta_factor = min(abs(self.inventory.delta) / 0.20, 1.0)  # Normalize to 20%
         skew_amount = half_spread_dollars * inventory_skew_pct * delta_factor
 
-        # AGGRESSIVE ONE-SIDED: If imbalance >1.5%, quote only on reducing side (tightened from 2%)
-        imbalance_threshold = 0.015  # 1.5% threshold for aggressive skew (reduced from 2%)
+        # AGGRESSIVE ONE-SIDED: If imbalance >0.5%, quote only on reducing side (EMERGENCY: reduced from 1.5%)
+        imbalance_threshold = 0.005  # EMERGENCY: 0.5% threshold for aggressive skew (reduced from 1.5%)
         if abs(self.inventory.delta) > imbalance_threshold:
             if self.inventory.delta > imbalance_threshold:  # Long - need to SELL
                 # Aggressive sell-only: Lower ASK significantly, keep bid normal
@@ -834,26 +971,26 @@ class MarketMakingStrategy:
         recent_spread = self.metrics.get_recent_spread_bps()
         if recent_spread is not None:
             if recent_spread < -3.0:  # Severe adverse selection
-                defensive_bps = 30.0  # 30 bps behind BBO (was $8 = 115 bps for US500!)
-                self.order_levels = 1  # Only 1 level
+                defensive_bps = 3.0  # 3 bps behind BBO (increased from 1bps to avoid adverse selection)
+                self.order_levels = 2  # 2 levels (reduced from 3 to limit exposure)
                 logger.debug(
-                    f"OPT#17 DEFENSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 1 level"
+                    f"OPT#17 DEFENSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, {self.order_levels} levels"
                 )
             elif recent_spread < 1.0:  # Low profit threshold
-                defensive_bps = 15.0  # 15 bps behind BBO
-                self.order_levels = 2  # 2 levels
+                defensive_bps = 0.0  # AT BBO (aggressive for HIP-3)
+                self.order_levels = 4  # 4 levels
                 logger.debug(
-                    f"OPT#17 CAUTIOUS: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 2 levels"
+                    f"OPT#17 CAUTIOUS: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, {self.order_levels} levels"
                 )
             elif recent_spread > 10.0:  # NEW: Aggressive mode for very profitable spreads
-                defensive_bps = 3.0  # 3 bps behind BBO (tight)
+                defensive_bps = 0.0  # AT BBO
                 self.order_levels = 5  # 5 levels for more liquidity
                 logger.debug(
-                    f"OPT#17 AGGRESSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 5 levels"
+                    f"OPT#17 AGGRESSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.1f} bps distance, 5 levels"
                 )
             else:  # Normal profitable range
-                defensive_bps = 8.0  # 8 bps behind BBO
-                self.order_levels = 3  # 3 levels
+                defensive_bps = 0.0  # AT BBO
+                self.order_levels = 4  # 4 levels
                 logger.debug(
                     f"OPT#17 NORMAL: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 3 levels"
                 )
@@ -875,8 +1012,27 @@ class MarketMakingStrategy:
         bid_price = round_price(bid_price, tick_size)
         ask_price = round_price(ask_price, tick_size)
 
-        # ENSURE MINIMUM SPREAD - OPT#13: 8 bps minimum
-        min_spread_dollars = mid * (max(self.min_spread_bps, 8.0) / 10000)
+        # ENSURE MINIMUM SPREAD - EMERGENCY ADVERSE SELECTION PROTECTION
+        # US500 HIP-3: Experiencing severe adverse selection, need much wider spreads
+        # BTC: Wider spreads, use 8 bps minimum
+        if self.symbol.upper() == "US500":
+            # For US500, check recent fill history for adverse selection
+            recent_spread = self.metrics.get_recent_spread_bps()
+            if recent_spread is not None and recent_spread < -5.0:  # Severe adverse selection
+                min_spread_bps = 15.0  # EMERGENCY: 15 bps when severe adverse selection
+                logger.warning(f"US500 EMERGENCY protection: {recent_spread:.1f} bps -> {min_spread_bps} bps min")
+            elif recent_spread is not None and recent_spread < -1.0:  # Adverse selection detected
+                min_spread_bps = 8.0  # Increase to 8 bps when adverse selection detected  
+                logger.debug(f"US500 adverse selection protection: {recent_spread:.1f} bps -> {min_spread_bps} bps min")
+            elif recent_spread is not None and recent_spread < 1.0:  # Poor performance
+                min_spread_bps = 6.0  # Moderate increase to 6 bps
+                logger.debug(f"US500 moderate protection: {recent_spread:.1f} bps -> {min_spread_bps} bps min") 
+            else:
+                min_spread_bps = 5.0  # 5 bps minimum when performing well (increased from 2 bps for better profitability)
+        else:
+            min_spread_bps = max(self.min_spread_bps, 8.0)  # 8 bps for main perps
+        
+        min_spread_dollars = mid * (min_spread_bps / 10000)
         if ask_price - bid_price < min_spread_dollars:
             gap = min_spread_dollars - (ask_price - bid_price)
             bid_price -= gap / 2
@@ -884,27 +1040,13 @@ class MarketMakingStrategy:
             bid_price = round_price(bid_price, tick_size)
             ask_price = round_price(ask_price, tick_size)
 
-        # OPTIMIZATION #14: ADAPTIVE DEFENSIVE DISTANCE
-        # Distance is already set above based on recent spread (OPT#17)
-        # This section just applies the distance - no need to recalculate
-        # Note: defensive_distance was set in lines 820-850 based on spread profitability
-
-        if orderbook.best_bid > 0:
-            # Our bid should be BELOW best bid by defensive_distance
-            max_bid = orderbook.best_bid - defensive_distance
-            if bid_price > max_bid:
-                bid_price = max_bid
-
-        if orderbook.best_ask > 0:
-            # Our ask should be ABOVE best ask by defensive_distance
-            min_ask = orderbook.best_ask + defensive_distance
-            if ask_price < min_ask:
-                ask_price = min_ask
+        # NOTE: Defensive distance already applied above - no need to re-apply
 
         # Final validation - never cross the spread
         if bid_price >= ask_price:
             mid_point = (bid_price + ask_price) / 2
-            min_half_spread = mid * 0.0005  # 5 bps minimum spread
+            # US500: 1 bps minimum, others: 5 bps
+            min_half_spread = mid * (0.0001 if self.symbol.upper() == "US500" else 0.0005)
             bid_price = round_price(mid_point - min_half_spread, tick_size)
             ask_price = round_price(mid_point + min_half_spread, tick_size)
 
@@ -1031,6 +1173,35 @@ class MarketMakingStrategy:
         orders_to_cancel = []
         orders_to_place = []
         now = time.time()
+        
+        # CRITICAL FIX: Force sync on first update cycle OR if we haven't synced in 30s
+        if not hasattr(self, "_last_order_sync"):
+            self._last_order_sync = 0
+        
+        time_since_sync = now - self._last_order_sync
+        have_tracked_orders = len(self.active_bids) + len(self.active_asks)
+        # Force sync if:
+        # 1. First run (never synced)
+        # 2. Have tracked orders but 30+ seconds since last sync
+        # 3. Have many tracked orders (possible phantom accumulation)
+        if (self._last_order_sync == 0 and have_tracked_orders > 0) or \
+           (have_tracked_orders > 0 and time_since_sync > 30) or \
+           (have_tracked_orders > 10):
+            logger.info(f"Forcing order sync: tracked={have_tracked_orders}, time_since_sync={time_since_sync:.0f}s")
+            await self._sync_active_orders()
+            self._last_order_sync = now
+        
+        # SAFETY LIMIT: Maximum orders per side to prevent accumulation
+        MAX_ORDERS_PER_SIDE = 10
+        
+        # Check if we have too many orders tracked - if so, cancel all and start fresh
+        total_tracked = len(self.active_bids) + len(self.active_asks)
+        if total_tracked > MAX_ORDERS_PER_SIDE * 2:
+            logger.warning(f"Order accumulation detected: {total_tracked} orders tracked. Cancelling all.")
+            await self._cancel_all_quotes()
+            # Clear and start fresh
+            self.active_bids.clear()
+            self.active_asks.clear()
 
         # Track last actual update time
         if not hasattr(self, "_last_actual_update"):
@@ -1183,6 +1354,9 @@ class MarketMakingStrategy:
         # FINAL CHECK: If nothing to place and nothing to cancel, skip
         if not orders_to_place and not orders_to_cancel:
             return
+        
+        # FIFO Order Management: Enforce order limits before placing new orders
+        await self._enforce_order_limits()
 
         # OPTIMIZED: Use batch cancel for lower latency instead of individual cancels
         if orders_to_cancel:
@@ -1309,17 +1483,22 @@ class MarketMakingStrategy:
             side: "buy" or "sell"
         """
         try:
-            # OPTIMIZATION: Check if we have recent sync data (< 10 seconds old)
+            is_hip3 = self.symbol.upper() == 'US500'
+            
+            # For HIP-3, always use local tracking since API doesn't return orders
+            # For standard perps, check if we have recent sync data
             now = time.time()
             recent_sync = hasattr(self, "_last_order_sync") and (now - self._last_order_sync) < 10.0
 
-            if recent_sync:
-                # Use local tracking instead of API call
+            if recent_sync or is_hip3:
+                # Use local tracking
                 if side == "buy":
                     orders_to_cancel = [(self.symbol, oid) for oid in self.active_bids.keys()]
+                    order_count = len(self.active_bids)
                     self.active_bids.clear()
                 else:
                     orders_to_cancel = [(self.symbol, oid) for oid in self.active_asks.keys()]
+                    order_count = len(self.active_asks)
                     self.active_asks.clear()
 
                 if orders_to_cancel:
@@ -1327,11 +1506,11 @@ class MarketMakingStrategy:
                     self.metrics.quotes_cancelled += cancelled
                     self.metrics.actions_today += cancelled
                     logger.info(
-                        f"Cancelled {cancelled} {side} orders for rebalancing (using cached data)"
+                        f"Cancelled {cancelled}/{order_count} {side} orders (local tracking)"
                     )
                 return
 
-            # Fallback: Get all open orders from exchange via info API
+            # Fallback for standard perps: Get all open orders from exchange via info API
             from hyperliquid.info import Info
             from hyperliquid.utils import constants as C
 
@@ -1343,10 +1522,11 @@ class MarketMakingStrategy:
 
             # Filter by side: 'B' for buy, 'A' for sell (Hyperliquid format)
             target_side = "B" if side == "buy" else "A"
+            target_coin = self.symbol.replace('/', '')
             orders_to_cancel = [
                 (self.symbol, o["oid"])
                 for o in open_orders
-                if o.get("side") == target_side and o.get("coin") == "BTC"
+                if o.get("side") == target_side and o.get("coin") == target_coin
             ]
 
             if side == "buy":
@@ -1383,8 +1563,10 @@ class MarketMakingStrategy:
         if time_since_last >= self.rebalance_interval:
             return True
 
-        # Critical inventory imbalance: delta > 70% needs faster action
-        if abs(self.inventory.delta) > 0.70:
+        # IMPROVED: Critical inventory imbalance - more aggressive threshold
+        # If delta > 30% (reduced from 70%), force rebalance
+        if abs(self.inventory.delta) > 0.30:
+            logger.warning(f"Force rebalance triggered: delta={self.inventory.delta:.3f} > 30%")
             return True
 
         return False
@@ -1405,10 +1587,11 @@ class MarketMakingStrategy:
 
         logger.info(f"Rebalancing inventory, delta: {self.inventory.delta:.3f}")
 
-        # Critical imbalance: use IOC taker orders with fresh REST BBO
-        # This bypasses WebSocket lag issues
+        # IMPROVED: Critical imbalance - lower threshold to 50% (from 100%)
+        # This bypasses WebSocket lag issues and prevents position accumulation
         abs_delta = abs(self.inventory.delta)
-        if abs_delta > 1.0:  # > 100% imbalance
+        if abs_delta > 0.50:  # > 50% imbalance (reduced from 100% to act faster)
+            logger.warning(f"Critical imbalance detected: {abs_delta:.1%} - using aggressive rebalance")
             await self._aggressive_rebalance()
             return
 

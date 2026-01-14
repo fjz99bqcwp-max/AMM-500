@@ -303,6 +303,7 @@ COLLATERAL=1000
 python amm-500.py
 
 # Start autonomous monitoring
+source .venv/bin/activate
 python scripts/amm_autonomous.py
 ```
 
