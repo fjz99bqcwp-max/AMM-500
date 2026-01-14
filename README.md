@@ -1,211 +1,183 @@
 # AMM-500: High-Frequency Market Making Bot
 
-A high-frequency trading bot for delta-neutral market making on **BTC** perpetuals on the Hyperliquid exchange. Originally designed for US500 (S&P 500 Index), but adapted to BTC as US500/SPX index perps are not available on Hyperliquid.
+A high-frequency trading bot for delta-neutral market making on **BTC** perpetuals on Hyperliquid. Clean, optimized, and ready for autonomous operation.
 
 > ⚠️ **WARNING: HIGH RISK**  
-> This is a leveraged trading bot for a **permissionless market**. You can lose your entire investment. Always:
-> - Test thoroughly on testnet first
+> This is a leveraged trading bot. You can lose your entire investment. Always:
+> - Test on paper trading first (7 days minimum)
 > - Start with small amounts ($1000 recommended)
-> - Monitor actively
-> - Understand the strategy before running
-> - Never risk money you can't afford to lose
-> 
-> **Currently configured for BTC** - the most liquid perpetual on Hyperliquid with tight spreads (0.11 bps) ideal for market making. Originally designed for US500/S&P 500 index, but US500 perps don't exist on Hyperliquid. The strategy parameters have been optimized via 30-day backtests achieving: **Sharpe 2.18, Ann ROI 59.1%, Max DD 0.47%, 3000+ trades/day**.
+> - Enable autonomous monitoring with kill switches
+> - Understand the strategy before using real money
+> - Never risk more than you can afford to lose
+
+**Performance (30-day backtest, 10x leverage):**  
+Sharpe 2.18 | Annual ROI 59.1% | Max DD 0.47% | 3000+ trades/day
+
+**Documentation:**
+- 📘 [HFT Optimization Guide](HFT_OPTIMIZATION_GUIDE.md) - Comprehensive HFT recommendations
+- 🤖 [Autonomous Setup Guide](AUTONOMOUS_SETUP_GUIDE.md) - 24/7 monitoring setup
+- 📊 [Cleanup Summary](CLEANUP_OPTIMIZATION_SUMMARY.md) - Recent optimizations
 
 ## Quick Start
 
 ```bash
-# 1. Clone and enter directory
--
-
-# 2. Create virtual environment
+# 1. Setup environment
 python3.10 -m venv .venv
 source .venv/bin/activate
-
-# 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Configure
+# 2. Configure (add your wallet keys)
 cp config/.env.example config/.env
-nano config/.env  # Add your credentials
+nano config/.env
 
-# 5. Fetch historical data
+# 3. Fetch BTC historical data
 python amm-500.py --fetch-data --fetch-days 180
 
-# 6. Run backtest
-python amm-500.py --backtest --months 6
-
-# 7. Paper trade (recommended first!)
-python amm-500.py --paper
-
-# 8. Live trade (after thorough testing)
-python amm-500.py
-```
-
-## Quick Commands
-
-```bash
-# Activate virtual environment
-source .venv/bin/activate
-
-# Run paper trading (mainnet data, simulated orders)
-python amm-500.py --paper
-
-# Run live trading (REAL MONEY!)
-python amm-500.py
-
-# Fetch US500 historical data (or BTC proxy)
-python amm-500.py --fetch-data --fetch-days 180
-
-# Run backtest (30 days default)
+# 4. Run 30-day backtest
 python amm-500.py --backtest --days 30
 
-# Run backtest with 12 months of data
-python amm-500.py --backtest --months 12
+# 5. Start 7-day paper trading (recommended)
+./scripts/start_paper_trading.sh
+# Select: 1 (Paper Trading), 1 (7 days)
 
-# Check connection status
-python amm-500.py --status
+# 6. Analyze results after 7 days
+python scripts/analyze_paper_results.py
 
-# Watch bot logs in real-time
-tail -f logs/bot_$(date +%Y-%m-%d).log
-
-# Find and kill the bot process
-pkill -f "python amm-500.py"
+# 7. Go live (after successful paper trading)
+./scripts/start_paper_trading.sh
+# Select: 2 (Live Trading), type "LIVE" to confirm
 ```
 
-## US500 Specific Information
+## Essential Commands
 
-### About US500 on Hyperliquid
+```bash
+# Activate environment
+source .venv/bin/activate
 
-- **Symbol**: US500 (accessed as km:US500 in the UI)
-- **Deployer**: KM (HIP-3 Permissionless)
-- **Max Leverage**: 25x
-- **Margin Type**: Isolated only
-- **Trading**: 24/7 (but underlying tracks US market hours)
-- **Documentation**: [docs.markets.xyz](https://docs.markets.xyz/)
-- **Trade Link**: [app.hyperliquid.xyz/trade/km:US500](https://app.hyperliquid.xyz/trade/km:US500)
+# Paper trading (7-day session with monitoring)
+./scripts/start_paper_trading.sh
 
-### Key Differences from BTC
+# Manual paper trading
+python amm-500.py --paper
 
-| Parameter | US500 | BTC |
-|-----------|-------|-----|
-| **Volatility** | 5-15% annualized | 50-100% annualized |
-| **Min Spread** | 1 bps | 5 bps |
-| **Max Spread** | 50 bps | 50 bps |
-| **Price Range** | ~5000-6000 | ~80000-100000 |
-| **Tick Size** | $0.01 | $1.00 |
-| **Max Leverage** | 25x | 50x |
+# Live trading (REAL MONEY - use with caution!)
+python amm-500.py
 
-### Data Proxy System
+# Backtest (30 days)
+python amm-500.py --backtest --days 30
 
-Since US500 is a newer asset, it may not have sufficient historical data for reliable backtesting. The bot includes an automatic fallback system:
+# Analyze paper trading results
+python scripts/analyze_paper_results.py
 
-1. **Check US500 Data**: Attempts to fetch US500 candles from Hyperliquid
-2. **Proxy Fallback**: If < 6 months of data available, uses BTC as proxy
-3. **Data Scaling**: BTC data is scaled to match US500 characteristics:
-   - Prices scaled to US500 range (~5800)
-   - Volatility compressed to 30% of BTC
-   - Funding rates reduced by 50%
-4. **Auto-Switch**: Bot checks periodically and switches to real data when available
+# Check connection
+python amm-500.py --status
 
-## Performance Targets
+# Monitor logs
+tail -f logs/bot_$(date +%Y-%m-%d).log
+tail -f logs/autonomous_v3.log
 
-| Leverage | Metric | Target | Validation |
-|----------|--------|--------|------------|
-| **x25** (STRESS-TEST) | Liquidation Prob | <5% | Run `--backtest --months 12` |
-| **x20** (RECOMMENDED) | Annual ROI | 30-50% | Sharpe ratio >2 |
-| **x10** (CONSERVATIVE) | Max Drawdown | <5% | 95th percentile |
+# Stop bot
+pkill -f "python.*amm-500"
+pkill -f "python.*autonomous"
+```
+
+## Autonomous Monitoring
+
+The bot includes comprehensive 24/7 monitoring with `amm_autonomous_v3.py`:
+
+**Features:**
+- ✅ Real-time wallet tracking (equity, PnL, margin, positions)
+- ✅ Auto-restart on crash (max 5/hour)
+- ✅ Email & Slack alerts (DD>2%, Taker>30%, Loss>$50)
+- ✅ Kill switches (DD>5%, 10 losses, $100 loss)
+- ✅ Trade metrics (maker/taker ratio, fees, PnL)
+- ✅ State persistence (survives restarts)
+
+**Start monitoring:**
+```bash
+python scripts/amm_autonomous_v3.py
+# Monitors every 5 minutes
+```
+
+**Configure alerts in `config/.env`:**
+```env
+SMTP_USER=your-email@gmail.com
+SMTP_PASS=your-app-password
+ALERT_EMAIL=your-alert-email@gmail.com
+SLACK_WEBHOOK=https://hooks.slack.com/services/YOUR/WEBHOOK
+```
+
+See [AUTONOMOUS_SETUP_GUIDE.md](AUTONOMOUS_SETUP_GUIDE.md) for complete setup.
 
 ## Architecture
 
 ```
 AMM-500/
-├── amm-500.py           # Entry point (US500 optimized)
-├── requirements.txt     # Python dependencies
-├── pyproject.toml       # Project configuration
-├── pytest.ini           # Test configuration
+├── amm-500.py                    # Main entry point
+├── requirements.txt              # Dependencies
+├── README.md                     # This file
+├── HFT_OPTIMIZATION_GUIDE.md    # HFT recommendations
+├── AUTONOMOUS_SETUP_GUIDE.md    # Monitoring setup
 ├── config/
-│   ├── .env             # Your configuration (not in git)
-│   └── .env.example     # Configuration template
-├── src/
-│   ├── __init__.py
-│   ├── config.py        # US500-optimized configuration
-│   ├── data_fetcher.py  # US500 data + BTC proxy system
-│   ├── exchange.py      # Hyperliquid client (US500 tick/lot)
-│   ├── strategy.py      # Market making logic
-│   ├── risk.py          # Risk management
-│   ├── backtest.py      # Backtesting framework
-│   ├── metrics.py       # Prometheus metrics
-│   └── utils.py         # Utility functions
-├── tests/               # Unit tests
-├── scripts/             # Utility scripts
-├── data/                # Historical data (US500 + BTC proxy)
-└── logs/                # Trading logs
+│   ├── .env                      # Your credentials (not in git)
+│   └── .env.example              # Configuration template
+├── src/                          # Core trading logic
+│   ├── config.py                 # Configuration management
+│   ├── exchange.py               # Hyperliquid client
+│   ├── strategy.py               # Market making strategy
+│   ├── risk.py                   # Risk management
+│   ├── backtest.py               # Backtesting framework
+│   ├── data_fetcher.py           # Data fetching
+│   ├── metrics.py                # Prometheus metrics
+│   └── utils.py                  # Utilities
+├── scripts/                      # Essential scripts (8 total)
+│   ├── amm_autonomous_v3.py      # Enhanced monitoring
+│   ├── start_paper_trading.sh    # Interactive launcher
+│   ├── analyze_paper_results.py  # Performance analysis
+│   ├── fetch_real_btc.py         # BTC data fetcher
+│   ├── grid_search.py            # Parameter optimization
+│   └── verify_targets.py         # Target validator
+├── tests/                        # Unit tests
+├── data/                         # Historical data (BTC)
+└── logs/                         # Trading logs
 ```
 
-## Installation Guide
+## Performance Targets
 
-### Prerequisites
+| Metric | Current | Optimized (HFT) | How to Achieve |
+|--------|---------|-----------------|----------------|
+| **Sharpe Ratio** | 2.18 | 2.8-3.2 | Tighter spreads, 1s rebalance, ML vol prediction |
+| **Annual ROI** | 59% | 80-95% | Higher turnover, better spread capture |
+| **Max Drawdown** | 0.47% | 0.3-0.4% | Faster delta-neutral, stricter risk |
+| **Trades/Day** | 3000+ | 4500-5500 | 1 bps spreads, 0.5s quote refresh |
+| **Maker Ratio** | ~88% | >95% | ALO orders only, taker cap <10% |
 
-- **Python 3.10** (required for compatibility)
-- **macOS/Linux** (Windows with WSL2)
-- **Git**
+See [HFT_OPTIMIZATION_GUIDE.md](HFT_OPTIMIZATION_GUIDE.md) for implementation details.
 
-### Step 1: Install Python 3.10
+## Configuration
 
-**macOS (Homebrew):**
-```bash
-brew install python@3.10
-```
-
-**Ubuntu/Debian:**
-```bash
-sudo apt update
-sudo apt install python3.10 python3.10-venv python3.10-pip
-```
-
-### Step 2: Clone and Setup
-
-```bash
-# Clone the repository
-cd /path/to/your/projects
-git clone <repository-url> AMM-500
-cd AMM-500
-
-# Create virtual environment
-python3.10 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### Step 3: Configure
-
-```bash
-# Copy the example configuration
-cp config/.env.example config/.env
-
-# Edit with your credentials
-nano config/.env
-```
-
-**Required settings in `.env`:**
+**Required in `config/.env`:**
 ```env
+# Wallet credentials
 PRIVATE_KEY=your_wallet_private_key
-WALLET_ADDRESS=your_wallet_address
-TESTNET=True  # Start with testnet!
-```
+WALLET_ADDRESS=0xYourWalletAddress
 
-### Step 4: Verify Installation
+# Trading parameters
+TESTNET=False              # Use mainnet (paper mode still simulates)
+LEVERAGE=10                # 10x recommended, max 50x for BTC
+COLLATERAL=1000            # Starting capital in USD
+MIN_SPREAD_BPS=5           # Minimum 5 bps (HFT: 1 bps)
+MAX_SPREAD_BPS=50          # Maximum 50 bps
 
-```bash
-# Check connection (requires testnet setup)
-python amm-500.py --status
+# Risk management
+MAX_DRAWDOWN=0.05          # 5% max drawdown
+STOP_LOSS_PCT=0.02         # 2% stop loss
 
-# Run tests
-pytest tests/ -v
+# Optional: Email/Slack alerts
+SMTP_USER=your-email@gmail.com
+SMTP_PASS=your-app-password
+ALERT_EMAIL=your-alert-email@gmail.com
+SLACK_WEBHOOK=https://hooks.slack.com/services/...
 ```
 
 ## Parameter Tuning for US500
@@ -275,181 +247,168 @@ LEVERAGE=10
 COLLATERAL=1000
 
 # Run paper trading
-python amm-500.py --paper
-```
+## Testing & Validation
 
-**Duration**: 7 days minimum
-
-**Validation Criteria:**
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Cumulative PnL | **> $20** (2%) | ~30% annualized |
-| Max Drawdown | **< 3%** | $30 max loss |
-| Imbalance Events | **< 5** | Hard stops |
-| Funding Net | **> $0** | Hedge working |
-
-### Phase 3: Live Trading x10 ($1000 Real)
-
-Only after passing Phase 1 **AND** Phase 2:
+**Run 7-day paper trading to validate performance:**
 
 ```bash
-# Configure for live
-TESTNET=False
-LEVERAGE=10
-COLLATERAL=1000
-
-# Fund wallet with exactly $1000 USDC
-# Start with active monitoring
-python amm-500.py
-
-# Start autonomous monitoring
-# Start autonomous monitoring (v3 with alerts and kill switches)
+cd /Users/nheosdisplay/VSC/AMM/AMM-500
 source .venv/bin/activate
-python scripts/amm_autonomous_v3.py
+./scripts/start_paper_trading.sh
 ```
 
-**Gradual Scale-Up Plan:**
-| Week | Collateral | Leverage | Notes |
-|------|------------|----------|-------|
-| 1 | $1,000 | x10 | Active monitoring |
-| 2-3 | $1,000 | x10 | Passive monitoring |
-| 4 | $2,000 | x10 | If 4 weeks profitable |
-| 8 | $5,000 | x15-x20 | If 8 weeks profitable |
-| 12+ | $10,000+ | x20 | Full production |
+The script will:
+- Prompt for mode (Paper/Live) and duration (7/30/Continuous)
+- Launch bot with autonomous monitoring (amm_autonomous_v3.py)
+- Track performance metrics (equity, PnL, trades, alerts)
+- Auto-stop after duration (or run continuously)
 
-**Kill Switch Triggers:**
-- Max DD > 5% → Stop and review
-- 3 consecutive losing days → Reduce to x5
-- Any single day loss > 3% → Pause 24h
+**After 7 days, analyze results:**
+
+```bash
+python scripts/analyze_paper_results.py
+```
+
+**Target Metrics (7-day paper):**
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Trades/Day | > 1000 | High-frequency target |
+| Maker Ratio | > 90% | Minimize taker fees |
+| 7-Day ROI | > 5% | ~200% annualized |
+| Max Drawdown | < 0.5% | Low risk tolerance |
+| Sharpe Ratio | 1.5-3.0 | Risk-adjusted performance |
+
+**Go live only after:**
+✅ Passing 7-day paper trading targets  
+✅ Understanding alert configurations  
+✅ Testing kill switches manually  
+✅ Funding wallet with exactly $1000 USDC
+
+For complete autonomous setup: See [AUTONOMOUS_SETUP_GUIDE.md](AUTONOMOUS_SETUP_GUIDE.md)
 
 ## Risk Management
 
-### Automatic Protections
+**Automatic Protections (Built-in):**
+1. **Dynamic Leverage Adjustment**: Reduces leverage when drawdown/volatility increase
+2. **Position Limits**: Enforces maximum exposure based on collateral
+3. **Stop Loss**: Closes positions on adverse moves > 2%
+4. **Circuit Breakers**: Pauses trading when approaching liquidation
+5. **Funding Hedge**: Monitors funding rates, hedges when > 0.01%
+6. **Kill Switches** (amm_autonomous_v3.py):
+   - Max DD > 5% → Auto-stop bot
+   - 10 consecutive losses → Auto-stop bot
+   - Session loss > $100 → Auto-stop bot
 
-1. **Leverage Reduction**: Reduces when drawdown/volatility increase
-2. **Position Limits**: Enforces maximum exposure
-3. **Stop Loss**: Closes position on adverse moves
-4. **Circuit Breakers**: Pauses trading when near liquidation
+**Risk Levels:**
 
-### Risk Levels
+| Level | Leverage | Spread | Action |
+|-------|----------|--------|--------|
+| LOW | 15-20x | 5-10 bps | Normal operation |
+| MEDIUM | 10-15x | 10-15 bps | Increased monitoring |
+| HIGH | 5-10x | 15-25 bps | Wide spreads, reduce size |
+| CRITICAL | < 5x | Pause | Close positions, review |
 
-| Level | Leverage | Action |
-|-------|----------|--------|
-| LOW | 20x | Normal operation |
-| MEDIUM | 15x | Increased monitoring |
-| HIGH | 10x | Wide spreads |
-| CRITICAL | 5x | Pause + close positions |
+**BTC-Specific Considerations:**
+- High volatility → Tighter stop losses, wider spreads
+- High funding rates → Reduce inventory bias, activate funding hedge
+- Low liquidity periods → Widen spreads, reduce position size
 
-### US500-Specific Risks
+## Monitoring & Logs
 
-1. **Low Liquidity**: Permissionless market may have thin order books
-2. **Oracle Risk**: Index price depends on external oracle
-3. **Market Hours**: Underlying only trades during US hours
-4. **Deployer Risk**: KM deployer controls market parameters
-5. **Isolated Margin**: Cannot share margin with other positions
+**Autonomous Monitoring (Recommended):**
 
-## Command Line Options
+The `amm_autonomous_v3.py` script provides 24/7 monitoring with:
+- Real-time wallet tracking (equity, PnL, margin, positions)
+- Email + Slack alerts (configurable cooldowns)
+- Auto-restart on bot crashes (rate-limited)
+- Kill switches (DD > 5%, 10 consecutive losses, $100 session loss)
+- Performance metrics (trades/day, maker ratio, Sharpe, ROI)
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--paper` | False | Paper trading mode |
-| `--backtest` | False | Run backtest |
-| `--days` | 30 | Days of data for backtest |
-| `--months` | 1 | Months of data (1-12) |
-| `--synthetic` | False | Use synthetic data |
-| `--fetch-data` | False | Fetch US500 historical data |
-| `--fetch-days` | 180 | Days of data to fetch |
-| `--status` | False | Check connection status |
-| `--config` | config/.env | Config file path |
-
-## Monitoring
-
-### Status Dashboard
-
+**Start monitoring:**
 ```bash
-# Quick status check
-python amm-500.py --status
+python scripts/amm_autonomous_v3.py
 ```
 
-### Log Monitoring
-
+**Check logs:**
 ```bash
-# Watch live logs
+# Live bot logs
 tail -f logs/bot_$(date +%Y-%m-%d).log
 
-# Watch trades
-tail -f logs/trades_$(date +%Y-%m-%d).log
+# Monitoring state
+cat logs/autonomous_state.json | jq '.trade_summary'
 
 # Search for errors
-grep -i error logs/bot_$(date +%Y-%m-%d).log
+grep -i error logs/bot_*.log
 ```
 
-### Prometheus Metrics
-
-Metrics exposed on port 9090 (configurable):
-- Position size/value
-- PnL (gross/net)
-- Fill rate
-- Latency
-- Risk metrics
+For complete autonomous setup (launch daemon, web dashboard, alerts): [AUTONOMOUS_SETUP_GUIDE.md](AUTONOMOUS_SETUP_GUIDE.md)
 
 ## Troubleshooting
 
-### Common Issues
+**Common Issues:**
 
-**"Insufficient historical data for US500"**
-- This is expected for new assets
-- Bot will use BTC as proxy automatically
-- Run `--fetch-data` to cache proxy data
+**"Connection timeout" / "API rate limit exceeded"**
+- Check network connection to Hyperliquid
+- Reduce rebalance_interval if hitting rate limits
+- Verify TESTNET setting in config/.env
 
-**"Max leverage exceeded"**
-- US500 max is 25x (vs 50x for BTC)
-- Reduce `LEVERAGE` in config
+**"Order rejected" / "Insufficient margin"**
+- Check wallet balance (min $1000 for 10x leverage)
+- Verify lot size meets minimum (0.001 BTC for BTC-PERP)
+- Check max leverage (50x for BTC)
 
-**"Order rejected"**
-- Check lot size (0.01 minimum)
-- Verify margin available
-- Check order book liquidity
+**"Bot not placing orders"**
+- Check spread configuration (min_spread_bps)
+- Verify market conditions (may be paused if volatility too high)
+- Review logs for risk level (CRITICAL = paused)
 
-**"Connection to permissionless market failed"**
-- Permissionless markets may have different API patterns
-- Check KM deployer documentation
-- Verify symbol format (US500, not km:US500 in API)
+**"Autonomous monitoring not sending alerts"**
+- Verify SMTP/Slack credentials in config/.env
+- Check email spam folder
+- Review logs/autonomous_state.json for alert cooldowns
 
-**"SDK not available"**
-```bash
-pip install hyperliquid-python-sdk
-```
+**"WebSocket connection errors"**
+- Normal occasional reconnects expected
+- Persistent errors → check firewall/network
+- Bot will retry automatically (tenacity decorator)
+
+**For more troubleshooting:** See [docs/FIXES_AND_STATUS.md](docs/FIXES_AND_STATUS.md)
 
 ## Disclaimer
 
-This software is provided for educational purposes only. Trading derivatives with leverage involves substantial risk of loss.
+This software is provided **for educational purposes only**. Trading derivatives with leverage involves **substantial risk of loss**.
 
 **Key Risks:**
-- **Market Risk**: Prices can move against your position rapidly
-- **Liquidation Risk**: Leveraged positions can be fully liquidated
-- **Liquidity Risk**: Permissionless markets may lack liquidity
-- **Technical Risk**: Software bugs, network issues, oracle failures
-- **Platform Risk**: Hyperliquid and KM deployer risks
-- **Regulatory Risk**: Index derivatives may face regulatory scrutiny
+- **Market Risk**: Crypto prices can move violently against your position
+- **Liquidation Risk**: Leveraged positions (10x+) can be fully liquidated
+- **Liquidity Risk**: Low liquidity may cause slippage and adverse fills
+- **Technical Risk**: Software bugs, network failures, API outages
+- **Platform Risk**: Hyperliquid smart contract and oracle risks
 
 **Always:**
-- Test thoroughly before using real funds
-- Start with minimal capital ($1000 max initially)
-- Never trade more than you can afford to lose
-- Monitor the bot actively
-- Have manual intervention plans ready
-- Understand the permissionless market risks
+✅ Test thoroughly with paper trading (7+ days)  
+✅ Start with minimal capital ($1000 max initially)  
+✅ Never trade more than you can afford to lose completely  
+✅ Monitor actively with autonomous_v3.py + alerts  
+✅ Understand all kill switch triggers before going live  
 
-## License
+**The author assumes NO responsibility for trading losses.**
 
-MIT License - See LICENSE file for details.
+## License & Support
+
+**License:** MIT License - See LICENSE file for details.
+
+**Documentation:**
+- [HFT_OPTIMIZATION_GUIDE.md](HFT_OPTIMIZATION_GUIDE.md) - HFT performance tuning
+- [AUTONOMOUS_SETUP_GUIDE.md](AUTONOMOUS_SETUP_GUIDE.md) - 24/7 monitoring setup
+- [CLEANUP_OPTIMIZATION_SUMMARY.md](CLEANUP_OPTIMIZATION_SUMMARY.md) - Project cleanup summary
+- [docs/FIXES_AND_STATUS.md](docs/FIXES_AND_STATUS.md) - Bug fixes and status
+
+**Hyperliquid Resources:**
+- Docs: https://hyperliquid.gitbook.io/hyperliquid-docs
+- Trade BTC-PERP: https://app.hyperliquid.xyz/trade/BTC
+- Python SDK: https://github.com/hyperliquid-dex/hyperliquid-python-sdk
 
 ---
 
-## Support
-
-- **Hyperliquid Docs**: https://hyperliquid.gitbook.io/hyperliquid-docs
-- **KM Deployer Docs**: https://docs.markets.xyz/
-- **US500 Trading**: https://app.hyperliquid.xyz/trade/km:US500
-- **SDK Repo**: https://github.com/hyperliquid-dex/hyperliquid-python-sdk
+**Ready to start?** Run `./scripts/start_paper_trading.sh` for 7-day paper trading.
