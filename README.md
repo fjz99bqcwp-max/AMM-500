@@ -303,8 +303,9 @@ COLLATERAL=1000
 python amm-500.py
 
 # Start autonomous monitoring
+# Start autonomous monitoring (v3 with alerts and kill switches)
 source .venv/bin/activate
-python scripts/amm_autonomous.py
+python scripts/amm_autonomous_v3.py
 ```
 
 **Gradual Scale-Up Plan:**

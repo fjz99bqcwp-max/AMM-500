@@ -85,7 +85,9 @@ class StrategyMetrics:
     recent_sell_prices: List[float] = field(default_factory=list)
     recent_buy_sizes: List[float] = field(default_factory=list)  # NEW: track sizes
     recent_sell_sizes: List[float] = field(default_factory=list)  # NEW: track sizes
-    max_recent_fills: int = 20  # Track last 20 fills
+    recent_fill_times: List[float] = field(default_factory=list)  # NEW: track timestamps
+    max_recent_fills: int = 10  # REDUCED from 20 to 10 for faster adaptation
+    fill_data_max_age: float = 300.0  # NEW: 5 minutes max age for fill data
 
     @property
     def fill_rate(self) -> float:
@@ -103,8 +105,27 @@ class StrategyMetrics:
 
     def get_recent_spread_bps(self) -> Optional[float]:
         """Calculate WEIGHTED spread from recent fills. Returns None if insufficient data."""
-        if not self.recent_buy_prices or not self.recent_sell_prices:
-            return None
+        # IMPROVED: Need both buys AND sells for valid spread calculation
+        if len(self.recent_buy_prices) < 3 or len(self.recent_sell_prices) < 3:
+            return None  # Not enough data - use default spread
+        
+        # Prune old fill data (older than 5 minutes)
+        import time
+        now = time.time()
+        if hasattr(self, 'recent_fill_times') and self.recent_fill_times:
+            # Keep only fills from last 5 minutes
+            while self.recent_fill_times and (now - self.recent_fill_times[0]) > self.fill_data_max_age:
+                self.recent_fill_times.pop(0)
+                if self.recent_buy_prices:
+                    self.recent_buy_prices.pop(0)
+                    self.recent_buy_sizes.pop(0)
+                if self.recent_sell_prices:
+                    self.recent_sell_prices.pop(0)
+                    self.recent_sell_sizes.pop(0)
+        
+        # Re-check after pruning
+        if len(self.recent_buy_prices) < 3 or len(self.recent_sell_prices) < 3:
+            return None  # Data too stale - use default spread
 
         # NEW: Weighted average by size (more accurate for market making)
         buy_sum = sum(p * s for p, s in zip(self.recent_buy_prices, self.recent_buy_sizes))
@@ -128,6 +149,17 @@ class StrategyMetrics:
 
     def add_fill(self, side: OrderSide, price: float, size: float = 0.0) -> None:
         """Track a fill for adverse selection detection (with size for weighted average)."""
+        import time
+        now = time.time()
+        
+        # Initialize fill times list if needed
+        if not hasattr(self, 'recent_fill_times'):
+            self.recent_fill_times = []
+        
+        self.recent_fill_times.append(now)
+        if len(self.recent_fill_times) > self.max_recent_fills * 2:
+            self.recent_fill_times.pop(0)
+        
         if side == OrderSide.BUY:
             self.recent_buy_prices.append(price)
             self.recent_buy_sizes.append(
@@ -265,6 +297,10 @@ class MarketMakingStrategy:
         # Register callbacks
         self.client.on_orderbook_update(self._on_orderbook_update)
         self.client.on_user_update(self._on_user_update)
+        
+        # Trade tracker for data logging and verification
+        from .trade_tracker import get_tracker
+        self.trade_tracker = get_tracker(config.wallet_address, self.symbol)
 
     async def _get_cached_orderbook(self) -> Optional[OrderBook]:
         """
@@ -302,14 +338,28 @@ class MarketMakingStrategy:
             # Initialize risk manager
             await self.risk_manager.initialize()
 
-            # Cancel any existing orders and clear local tracking
-            await self.client.cancel_all_orders(self.symbol)
+            # AGGRESSIVE STARTUP CLEANUP: Cancel ALL orders for this symbol
+            # This is critical for HIP-3 perps where stale orders accumulate
+            logger.info(f"Startup cleanup: Cancelling all {self.symbol} orders...")
+            cancelled_count = await self.client.cancel_all_orders(self.symbol)
+            logger.info(f"Startup cleanup: Cancelled {cancelled_count} orders")
+            
+            # Double-check by trying again (in case of race condition)
+            cancelled_count_2 = await self.client.cancel_all_orders(self.symbol)
+            if cancelled_count_2 > 0:
+                logger.warning(f"Startup cleanup (2nd pass): Cancelled {cancelled_count_2} additional orders")
+            
             self.active_bids.clear()
             self.active_asks.clear()
             logger.info("Cleared local order tracking on startup")
 
             # Load initial state
             await self._refresh_inventory()
+            
+            # Start trade tracking session with current equity
+            self.trade_tracker.reset_session()
+            self.trade_tracker.start_session(self.current_equity)
+            logger.info(f"Trade tracker started with ${self.current_equity:.2f} equity")
 
             # Sync recent fills for OPT#14 adaptive mode
             await self._sync_recent_fills()
@@ -395,37 +445,59 @@ class MarketMakingStrategy:
             is_hip3 = self.symbol.upper() == 'US500'
             
             if is_hip3:
-                # HIP-3: Use openOrders API to get ground truth
+                # HIP-3: openOrders API doesn't work for km: perps
+                # Use historicalOrders and filter for status='open' instead
                 import requests
-                from eth_account import Account
                 
                 try:
-                    # CRITICAL FIX: Query orders from the actual signing wallet, not WALLET_ADDRESS
-                    # The PRIVATE_KEY derives to the API wallet, so orders are placed from there
-                    signing_wallet = Account.from_key(self.config.private_key)
-                    query_address = signing_wallet.address
+                    # IMPORTANT: When using API wallet, orders are placed ON BEHALF OF the main wallet
+                    # So we must query the MAIN wallet (config.wallet_address), NOT the signing wallet
+                    query_address = self.config.wallet_address
                     
-                    logger.debug(f"Querying openOrders for signing wallet: {query_address}")
+                    logger.debug(f"Querying historicalOrders for main wallet: {query_address}")
                     
+                    # Use historicalOrders since openOrders doesn't work for HIP-3
                     resp = requests.post("https://api.hyperliquid.xyz/info", json={
-                        "type": "openOrders",
-                        "user": query_address  # Query the API wallet, not the main wallet
+                        "type": "historicalOrders",
+                        "user": query_address
                     }, timeout=10)
-                    open_orders = resp.json()
+                    historical_orders = resp.json()
                     
-                    # DEBUG: Log what openOrders returns
-                    logger.debug(f"HIP-3 openOrders response: {len(open_orders)} orders")
-                    if open_orders:
-                        logger.debug(f"Sample order: {open_orders[0]}")
-                    
-                    # Build set of actual open order IDs
-                    # Note: coin field might be "km:US500" or just "US500"
+                    # Filter for our symbol and open status
                     target_symbols = [f'km:{self.symbol}', self.symbol.upper()]
-                    exchange_order_ids = {
-                        str(order.get('oid')) 
-                        for order in open_orders 
-                        if order.get('coin') in target_symbols
-                    }
+                    
+                    # CRITICAL FIX: historicalOrders returns multiple records per order
+                    # We must deduplicate by OID and only keep orders where LATEST status is 'open'
+                    from collections import defaultdict
+                    by_oid = defaultdict(list)
+                    for o in historical_orders:
+                        coin = o.get('order', {}).get('coin', '')
+                        if coin in target_symbols:
+                            oid = str(o.get('order', {}).get('oid', ''))
+                            if oid:
+                                by_oid[oid].append(o)
+                    
+                    # Find orders where latest status is 'open'
+                    open_orders = []
+                    for oid, records in by_oid.items():
+                        records.sort(key=lambda x: x.get('statusTimestamp', 0), reverse=True)
+                        latest = records[0]
+                        if latest.get('status') == 'open':
+                            open_orders.append(latest)
+                    
+                    # DEBUG: Log what historicalOrders returns
+                    logger.debug(f"HIP-3 historicalOrders: {len(historical_orders)} total, {len(open_orders)} open for {self.symbol}")
+                    
+                    # Build set of actual open order IDs from historicalOrders format
+                    # historicalOrders returns: {"order": {"oid": 123, "coin": "km:US500", ...}, "status": "open", ...}
+                    exchange_order_ids = set()
+                    for o in open_orders:
+                        order = o.get('order', {})
+                        oid = str(order.get('oid', ''))
+                        if oid:
+                            exchange_order_ids.add(oid)
+                    
+                    logger.debug(f"Found {len(exchange_order_ids)} open orders on exchange")
                     
                     # Find stale orders (tracked locally but not on exchange)
                     all_tracked_oids = set(self.active_bids.keys()) | set(self.active_asks.keys())
@@ -438,12 +510,33 @@ class MarketMakingStrategy:
                         for oid in stale_orders:
                             self.active_bids.pop(oid, None)
                             self.active_asks.pop(oid, None)
+                        # IMPROVEMENT: If all orders are phantom, clear everything and start fresh
+                        if len(stale_orders) == len(all_tracked_oids) and len(stale_orders) > 0:
+                            logger.warning("All tracked orders were phantom - resetting fill metrics to avoid stale defensive mode")
+                            self.metrics.recent_buy_prices.clear()
+                            self.metrics.recent_sell_prices.clear()
+                            self.metrics.recent_buy_sizes.clear()
+                            self.metrics.recent_sell_sizes.clear()
+                            if hasattr(self.metrics, 'recent_fill_times'):
+                                self.metrics.recent_fill_times.clear()
                     
                     # Check for orphaned orders (on exchange but not tracked)
                     orphaned = exchange_order_ids - all_tracked_oids
                     if orphaned:
-                        logger.warning(f"HIP-3 order sync: Found {len(orphaned)} orphaned orders (on exchange but not tracked locally)")
-                        # Could add them to tracking, but safer to cancel and replace
+                        logger.warning(f"HIP-3 order sync: Found {len(orphaned)} orphaned orders (on exchange but not tracked locally) - CANCELLING")
+                        # CRITICAL FIX: Cancel orphaned orders to prevent accumulation
+                        # These are orders from previous bot sessions or tracking failures
+                        # NOTE: For HIP-3 perps, use km: prefix in symbol
+                        api_symbol = f"km:{self.symbol}" if self.symbol.upper() == "US500" else self.symbol
+                        try:
+                            orphan_cancels = [(api_symbol, oid) for oid in orphaned]
+                            cancelled = await self.client.cancel_orders_batch(orphan_cancels)
+                            logger.info(f"HIP-3 order sync: Cancelled {cancelled} orphaned orders")
+                        except Exception as cancel_err:
+                            logger.error(f"Failed to cancel orphaned orders: {cancel_err}")
+                            # Fallback: cancel all orders for this symbol
+                            await self.client.cancel_all_orders(self.symbol)
+                            logger.info("Fallback: Cancelled all orders via cancel_all_orders")
                     
                     logger.debug(f"HIP-3 order sync complete: {len(self.active_bids)} bids, {len(self.active_asks)} asks tracked | {len(exchange_order_ids)} total on exchange")
                     return
@@ -667,11 +760,53 @@ class MarketMakingStrategy:
                 await self._refresh_inventory()
                 self._last_inventory_refresh = now
                 self._api_call_metrics["inventory_refreshes"] += 1
+            
+            # CRITICAL: Check minimum equity before placing orders
+            # Minimum $10 required to place minimum size orders ($0.10 * 100 = $10 margin)
+            MIN_EQUITY_REQUIRED = 10.0
+            if self.current_equity < MIN_EQUITY_REQUIRED:
+                # Log every 60 seconds to avoid spam
+                if now - getattr(self, "_last_equity_warning", 0) > 60.0:
+                    logger.warning(
+                        f"INSUFFICIENT EQUITY: ${self.current_equity:.2f} < ${MIN_EQUITY_REQUIRED:.2f} required. "
+                        f"Please fund account to trade. Pausing order placement..."
+                    )
+                    self._last_equity_warning = now
+                # Cancel any existing orders and pause
+                if self.active_bids or self.active_asks:
+                    await self.client.cancel_all_orders(self.symbol)
+                    self.active_bids.clear()
+                    self.active_asks.clear()
+                return
 
-            # Synchronize active orders with exchange every 60 seconds (reduced from 30)
-            if now - getattr(self, "_last_order_sync", 0) > 60.0:
+            # Synchronize active orders with exchange every 30 seconds
+            # Critical for HIP-3 to catch orphaned orders quickly
+            if now - getattr(self, "_last_order_sync", 0) > 30.0:
                 await self._sync_active_orders()
                 self._last_order_sync = now
+            
+            # AGGRESSIVE CLEANUP: Every 2 minutes, do a full cancel-all if we detect drift
+            # This catches any orders that slipped through normal sync
+            if now - getattr(self, "_last_aggressive_cleanup", 0) > 120.0:
+                self._last_aggressive_cleanup = now
+                try:
+                    import requests
+                    resp = requests.post("https://api.hyperliquid.xyz/info", json={
+                        "type": "openOrders",
+                        "user": self.config.wallet_address
+                    }, timeout=10)
+                    all_orders = resp.json()
+                    symbol_orders = [o for o in all_orders if o.get('coin') in [f'km:{self.symbol}', self.symbol.upper()]]
+                    tracked_count = len(self.active_bids) + len(self.active_asks)
+                    
+                    # If exchange has significantly more orders than we're tracking, cancel all
+                    if len(symbol_orders) > tracked_count + 5:
+                        logger.warning(f"AGGRESSIVE CLEANUP: Exchange has {len(symbol_orders)} orders but only tracking {tracked_count}. Cancelling all!")
+                        await self.client.cancel_all_orders(self.symbol)
+                        self.active_bids.clear()
+                        self.active_asks.clear()
+                except Exception as e:
+                    logger.debug(f"Aggressive cleanup check failed: {e}")
 
             # Check risk first
             risk_metrics = await self.risk_manager.check_risk()
@@ -968,37 +1103,39 @@ class MarketMakingStrategy:
         # Use bps-based distances that scale with price (not fixed dollar amounts)
         # For US500 at $693: 10 bps = $0.69, 20 bps = $1.39
         # For BTC at $90000: 10 bps = $9.00, 20 bps = $18.00
+        # NOTE: We scale levels as percentage of configured order_levels, not hardcoded values
+        configured_levels = self.config.trading.order_levels  # User's configured level count
         recent_spread = self.metrics.get_recent_spread_bps()
         if recent_spread is not None:
             if recent_spread < -3.0:  # Severe adverse selection
                 defensive_bps = 3.0  # 3 bps behind BBO (increased from 1bps to avoid adverse selection)
-                self.order_levels = 2  # 2 levels (reduced from 3 to limit exposure)
+                self.order_levels = max(10, configured_levels // 4)  # 25% of configured levels
                 logger.debug(
                     f"OPT#17 DEFENSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, {self.order_levels} levels"
                 )
             elif recent_spread < 1.0:  # Low profit threshold
                 defensive_bps = 0.0  # AT BBO (aggressive for HIP-3)
-                self.order_levels = 4  # 4 levels
+                self.order_levels = max(20, configured_levels // 2)  # 50% of configured levels
                 logger.debug(
                     f"OPT#17 CAUTIOUS: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, {self.order_levels} levels"
                 )
             elif recent_spread > 10.0:  # NEW: Aggressive mode for very profitable spreads
                 defensive_bps = 0.0  # AT BBO
-                self.order_levels = 5  # 5 levels for more liquidity
+                self.order_levels = configured_levels  # Full configured levels
                 logger.debug(
-                    f"OPT#17 AGGRESSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.1f} bps distance, 5 levels"
+                    f"OPT#17 AGGRESSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.1f} bps distance, {self.order_levels} levels"
                 )
             else:  # Normal profitable range
                 defensive_bps = 0.0  # AT BBO
-                self.order_levels = 4  # 4 levels
+                self.order_levels = max(50, int(configured_levels * 0.75))  # 75% of configured levels
                 logger.debug(
-                    f"OPT#17 NORMAL: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 3 levels"
+                    f"OPT#17 NORMAL: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, {self.order_levels} levels"
                 )
         else:
-            # Default when insufficient data
-            defensive_bps = 8.0  # 8 bps
-            self.order_levels = min(self.config.trading.order_levels, 3)
-            logger.debug(f"OPT#17 DEFAULT: insufficient data → {defensive_bps:.0f} bps distance")
+            # Default when insufficient data - use configured levels
+            defensive_bps = 0.0  # AT BBO to ensure fills
+            self.order_levels = configured_levels
+            logger.debug(f"OPT#17 DEFAULT: insufficient/stale data → using {configured_levels} levels at BBO")
         
         # Convert bps to dollar distance
         defensive_distance = mid * (defensive_bps / 10000.0)
@@ -1073,17 +1210,18 @@ class MarketMakingStrategy:
         asks = []
 
         # OPT#14: Adapt number of levels based on recent performance
+        # For 100-level operation, we scale back proportionally rather than drastically
         recent_spread = self.metrics.get_recent_spread_bps()
         if recent_spread is not None and recent_spread < -2.0:
-            # Adverse selection detected - reduce to 1 level
-            effective_levels = 1
+            # Adverse selection detected - reduce to 50% of configured levels
+            effective_levels = max(10, self.order_levels // 2)
             logger.warning(
-                f"Reducing to {effective_levels} level due to adverse selection "
+                f"Reducing to {effective_levels} levels due to adverse selection "
                 f"(recent spread: {recent_spread:.2f} bps)"
             )
         elif recent_spread is not None and recent_spread < 2.0:
-            # Low profitability - reduce to 2 levels
-            effective_levels = min(2, self.order_levels)
+            # Low profitability - reduce to 75% of configured levels
+            effective_levels = max(20, int(self.order_levels * 0.75))
         else:
             # Normal operation - use configured levels
             effective_levels = self.order_levels
@@ -1100,11 +1238,17 @@ class MarketMakingStrategy:
             min_size = max(0.00012, 10.5 / mid)  # $10.50 notional for safety
 
         # OPTIMIZATION #4: Ensure base_size is scaled to allow all levels
-        # With 15% pyramiding reduction, level 2 is 70% of base
-        # Scale up base_size so smallest level still meets minimum
-        levels_pyramid_factor = 1 - (effective_levels - 1) * 0.15  # Adjusted for effective_levels
+        # With pyramiding reduction, scale up base_size so smallest level still meets minimum
+        # Use adaptive pyramid factor based on level count
+        if effective_levels > 50:
+            pyramid_factor = 0.005  # 0.5% per level for 50+ levels
+        elif effective_levels > 10:
+            pyramid_factor = 0.03  # 3% per level for 10-50 levels
+        else:
+            pyramid_factor = 0.08  # 8% per level for <10 levels
+        levels_pyramid_factor = 1 - (effective_levels - 1) * pyramid_factor
         required_base = min_size / max(
-            levels_pyramid_factor, 0.5
+            levels_pyramid_factor, 0.1
         )  # Ensure smallest level >= min_size
         effective_base = max(base_size, required_base)
 
@@ -1124,7 +1268,14 @@ class MarketMakingStrategy:
 
         for i in range(effective_levels):  # Use effective_levels instead of self.order_levels
             # Decrease size for outer levels (pyramiding)
-            level_size = effective_base * (1 - i * 0.15)
+            # Use adaptive pyramid factor based on level count
+            if effective_levels > 50:
+                pyramid_factor = 0.005  # 0.5% per level for 50+ levels
+            elif effective_levels > 10:
+                pyramid_factor = 0.03  # 3% per level for 10-50 levels
+            else:
+                pyramid_factor = 0.08  # 8% per level for <10 levels
+            level_size = effective_base * (1 - i * pyramid_factor)
             # Skip if below minimum size requirement (safety check)
             if level_size < min_size:
                 logger.warning(f"Level {i} size {level_size:.6f} < min {min_size:.6f} - skipping")
@@ -1192,12 +1343,13 @@ class MarketMakingStrategy:
             self._last_order_sync = now
         
         # SAFETY LIMIT: Maximum orders per side to prevent accumulation
-        MAX_ORDERS_PER_SIDE = 10
+        # Set to 2x configured order_levels to allow for normal operation
+        MAX_ORDERS_PER_SIDE = self.config.trading.order_levels * 2
         
         # Check if we have too many orders tracked - if so, cancel all and start fresh
         total_tracked = len(self.active_bids) + len(self.active_asks)
         if total_tracked > MAX_ORDERS_PER_SIDE * 2:
-            logger.warning(f"Order accumulation detected: {total_tracked} orders tracked. Cancelling all.")
+            logger.warning(f"Order accumulation detected: {total_tracked} orders tracked (max {MAX_ORDERS_PER_SIDE*2}). Cancelling all.")
             await self._cancel_all_quotes()
             # Clear and start fresh
             self.active_bids.clear()
@@ -1757,6 +1909,18 @@ class MarketMakingStrategy:
                 f"PnL: ${closed_pnl:+.4f} | Net: ${net_pnl:+.4f} | "
                 f"{'maker' if is_maker else 'TAKER'}"
             )
+            
+            # Log fill to trade tracker and verify order count
+            self.trade_tracker.log_fill(fill)
+            self.trade_tracker.update_equity(self.current_equity)
+            
+            # VERIFY: Check order count matches exchange after each fill
+            expected_bids = len(self.active_bids)
+            expected_asks = len(self.active_asks)
+            if not self.trade_tracker.verify_order_count(expected_bids, expected_asks):
+                logger.warning("Order count mismatch detected after fill - will sync on next iteration")
+                # Reset last sync time to force sync on next run_iteration
+                self._last_order_sync = 0
 
         except Exception as e:
             logger.error(f"Error processing fill: {e}")

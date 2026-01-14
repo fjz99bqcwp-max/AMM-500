@@ -1410,7 +1410,11 @@ class HyperliquidClient:
 
     async def cancel_all_orders(self, symbol: Optional[str] = None) -> int:
         """
-        Cancel all open orders.
+        Cancel all open orders by fetching from exchange first.
+        
+        This fetches orders directly from the exchange (not local cache)
+        to ensure ALL orders are cancelled, including stale ones from
+        previous bot sessions.
 
         Args:
             symbol: Optional symbol filter
@@ -1443,25 +1447,63 @@ class HyperliquidClient:
         await self._rate_limiter.acquire(weight=1)
 
         try:
+            from hyperliquid.utils.signing import CancelRequest
+            import requests
+
             coin = symbol or self.config.trading.symbol
-
-            # Get open orders from cache or refresh
-            orders_to_cancel = [
-                order for order in self._open_orders.values() if order.symbol == coin
-            ]
-
+            api_symbol = self._get_api_symbol(coin)
+            is_hip3 = coin.upper() == "US500"
+            
+            # CRITICAL FIX: For HIP-3 perps, openOrders returns empty
+            # Use historicalOrders and deduplicate by OID, checking latest status
+            if is_hip3:
+                resp = requests.post("https://api.hyperliquid.xyz/info", json={
+                    "type": "historicalOrders",
+                    "user": self.config.wallet_address
+                }, timeout=10)
+                historical = resp.json()
+                
+                # IMPORTANT: historicalOrders returns multiple records per order
+                # We must group by OID and only keep orders where LATEST status is 'open'
+                from collections import defaultdict
+                by_oid = defaultdict(list)
+                for o in historical:
+                    if o.get("order", {}).get("coin") == api_symbol:
+                        oid = o.get("order", {}).get("oid")
+                        by_oid[oid].append(o)
+                
+                # Find orders where latest status is 'open'
+                orders_to_cancel = []
+                for oid, records in by_oid.items():
+                    records.sort(key=lambda x: x.get("statusTimestamp", 0), reverse=True)
+                    latest = records[0]
+                    if latest.get("status") == "open":
+                        orders_to_cancel.append({
+                            "oid": oid,
+                            "coin": api_symbol
+                        })
+            else:
+                # Standard perps: openOrders works fine
+                exchange_orders = self._info.open_orders(self.config.wallet_address)
+                orders_to_cancel = [
+                    o for o in exchange_orders if o.get("coin") == api_symbol
+                ]
+            
             if not orders_to_cancel:
-                logger.debug(f"No open orders to cancel for {coin}")
+                logger.debug(f"No open orders to cancel for {coin} ({api_symbol})")
+                # Clear local cache too
+                self._open_orders = {
+                    oid: order for oid, order in self._open_orders.items() if order.symbol != coin
+                }
                 return 0
 
+            logger.info(f"Found {len(orders_to_cancel)} orders on exchange for {api_symbol}")
+            
             # Build cancel requests for bulk_cancel
-            from hyperliquid.utils.signing import CancelRequest
-
-            # Use API symbol format (km: prefix for HIP-3 perps)
-            api_symbol = self._get_api_symbol(coin)
             cancel_requests = [
-                CancelRequest(coin=api_symbol, oid=int(order.order_id))
-                for order in orders_to_cancel
+                CancelRequest(coin=api_symbol, oid=int(o.get("oid")))
+                for o in orders_to_cancel
+                if o.get("oid")
             ]
 
             result = self._exchange.bulk_cancel(cancel_requests)
@@ -1483,7 +1525,7 @@ class HyperliquidClient:
                 logger.info(f"Cancelled {cancelled} orders for {coin} (str response)")
                 return cancelled
             else:
-                logger.warning("Failed to cancel all orders")
+                logger.warning(f"Failed to cancel all orders: {result}")
                 return 0
 
         except Exception as e:
@@ -1685,39 +1727,43 @@ class HyperliquidClient:
             perps_equity = float(margin.get("accountValue", 0))
             perps_available = float(margin.get("withdrawable", 0))
             
-            # For HIP-3 perps (km:US500), also check Spot USDH balance
-            # USDH in Spot can be used as margin for HIP-3 perps
+            # For HIP-3 perps (km:US500), check USDH balance (Spot + Perp)
+            # km:US500 trades on ISOLATED margin using USDH as collateral
             spot_usdh_total = 0.0
             spot_usdh_hold = 0.0
+            perp_usdh_total = 0.0  # USDH deposited in perp for isolated margin
             if self.config.trading.symbol.upper() == "US500":
                 try:
+                    # Get Spot USDH balance
                     spot_state = self._info.spot_user_state(self.config.wallet_address)
                     for b in spot_state.get("balances", []):
                         if b.get("coin") == "USDH":
                             spot_usdh_total = float(b.get("total", 0))  # Total including held
                             spot_usdh_hold = float(b.get("hold", 0))   # Held by open orders
                             break
-                    if spot_usdh_total > 0:
-                        logger.debug(f"HIP-3: USDH total=${spot_usdh_total:.2f}, hold=${spot_usdh_hold:.2f}, available=${spot_usdh_total - spot_usdh_hold:.2f}")
+                    
+                    # For isolated margin positions, USDH used as margin is tracked separately
+                    # The position margin is part of the total USDH available for trading
+                    # Total USDH available = spot USDH + any USDH already in isolated positions
+                    logger.debug(f"HIP-3 USDH: spot=${spot_usdh_total:.2f}, hold=${spot_usdh_hold:.2f}")
                 except Exception as e:
                     logger.debug(f"Could not check Spot USDH: {e}")
             
-            # For US500 isolated trading: Use PERP ACCOUNT EQUITY directly
-            # This is the actual balance that can be used for trading
-            # Spot USDH is separate and not directly usable for perp margin
+            # For US500 (km:US500): Use USDH as the trading balance
+            # km:US500 uses ISOLATED margin with USDH collateral, NOT cross-margin USDC
             if self.config.trading.symbol.upper() == "US500":
-                # US500 (km:US500) uses isolated margin - perp account equity is the CORRECT balance
-                total_equity = perps_equity  # Use perp account equity directly
-                total_available = perps_available  # Use perp available balance
-                if spot_usdh_total > 0:
-                    logger.debug(f"US500: Using perp equity ${perps_equity:.2f}, spot USDH ${spot_usdh_total:.2f} (reference only)")
+                # Total equity = Spot USDH (available for new positions)
+                # The margin already in positions is separate and managed by exchange
+                total_equity = spot_usdh_total  # USDH is the collateral for km:US500
+                total_available = spot_usdh_total - spot_usdh_hold  # Available for new orders
+                logger.debug(f"US500 ISOLATED: USDH equity=${total_equity:.2f}, available=${total_available:.2f}")
             else:
-                # For other symbols that might use cross-margin
+                # For other symbols that use cross-margin USDC
                 total_equity = perps_equity + spot_usdh_total
                 total_available = perps_available + (spot_usdh_total - spot_usdh_hold)
             
             self._account_state = AccountState(
-                equity=total_equity,  # Use PERP ACCOUNT EQUITY for isolated US500 trading
+                equity=total_equity,  # USDH balance for US500 isolated margin
                 available_balance=total_available,  # Available for new orders
                 margin_used=float(margin.get("totalMarginUsed", 0)),
                 hold_balance=spot_usdh_hold,  # Track held amount

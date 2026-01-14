@@ -89,3 +89,16 @@ dmypy.json
 
 # pyenv
 .python-version
+# Archived files (cleanup)
+archive/
+_archived/
+scripts/_archived/
+data/_archived/
+logs/_archived/
+
+# Generated logs
+logs/*.log
+logs/*.out
+logs/*.png
+logs/*.json
+!logs/README.md

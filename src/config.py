@@ -220,7 +220,7 @@ class Config:
                 min_spread_bps=get_env_float("MIN_SPREAD_BPS", 3.0),  # 3 bp min for US500 (increased from 1bp for profitability)
                 max_spread_bps=get_env_float("MAX_SPREAD_BPS", 50.0),
                 order_size_fraction=get_env_float("ORDER_SIZE_FRACTION", 0.01),  # Reduced from 0.02 to 0.01 (1% per order)
-                order_levels=get_env_int("ORDER_LEVELS", 5),  # Reduced from 20 to 5 levels for better control
+                order_levels=get_env_int("ORDER_LEVELS", 100),  # 100 levels per side (200 total)
             ),
             risk=RiskConfig(
                 max_drawdown=get_env_float("MAX_DRAWDOWN", 0.05),
