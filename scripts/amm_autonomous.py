@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Continuous Monitoring and Auto-Optimization System
+Continuous Monitoring and Auto-Optimization System for US500
 
 This script continuously:
-1. Analyzes real-time trading data directly from Hyperliquid API (2000 fills)
-2. Detects errors and performance issues
-3. Monitors strategy adherence with weighted averages
-4. Auto-applies optimizations autonomously
-5. Restarts bot if critical errors detected
-6. Tracks detailed cycle metrics with state persistence
-7. Runs indefinitely with robust error handling
+1. Analyzes real-time US500 trading data from Hyperliquid API (2000 fills)
+2. Collects US500 1-minute candles (saved to data/us500_candles_1m.csv)
+3. Detects errors and performance issues
+4. Monitors strategy adherence with weighted averages
+5. Auto-applies optimizations autonomously
+6. Restarts bot if critical errors detected
+7. Tracks detailed cycle metrics with state persistence
+8. Runs indefinitely with robust error handling
+
+Supports:
+- US500 (km:US500) primary symbol
+- XYZ100 (xyz:XYZ100) as historical fallback proxy
 """
 
 import requests
@@ -18,15 +23,26 @@ import subprocess
 import sys
 import os
 import json
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# User wallet for real-time data validation
-WALLET = "0x1cCC14E273DEF02EF2BF62B9bb6B6cAa15805f9C"
+# Import US500 data collector
+from src.us500_data_collector import get_collector
+
+# Load credentials from .env
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / "config" / ".env")
+
+# User wallet for real-time data validation (funded wallet)
+WALLET = os.getenv("WALLET_ADDRESS", "0x1cCC14E273DEF02EF2BF62B9bb6B6cAa15805f9C")
 URL = "https://api.hyperliquid.xyz/info"
+
+# Trading symbol - US500 for S&P 500 Index perpetual
+SYMBOL = os.getenv("SYMBOL", "km:US500").replace("km:", "")
 
 # AMM-500 paths (auto-detected)
 BASE_DIR = Path(__file__).parent.parent
@@ -186,16 +202,40 @@ class PerformanceMonitor:
             total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
             total_ntl_pos = float(margin_summary.get("totalNtlPos", 0))
 
-            # Get position info
+            # For HIP-3 perps (US500), check Spot USDH balance as primary balance
+            # USDH in Spot is used as margin for HIP-3 perps
+            spot_usdh = 0.0
+            if SYMBOL.upper() == "US500":
+                try:
+                    spot_resp = requests.post(URL, json={"type": "spotClearinghouseState", "user": WALLET}, timeout=10)
+                    spot_state = spot_resp.json()
+                    for b in spot_state.get("balances", []):
+                        if b.get("coin") == "USDH":
+                            spot_usdh = float(b.get("total", 0))
+                            break
+                    
+                    # For US500, use Spot USDH as the primary balance source
+                    if spot_usdh > 0:
+                        log("DEBUG", f"HIP-3: Using ${spot_usdh:.2f} USDH from Spot as account value")
+                        account_value = spot_usdh
+                        
+                except Exception as e:
+                    log("DEBUG", f"Could not check Spot USDH: {e}")
+
+            # Get position info - for HIP-3 perps, coin format is km:SYMBOL
             asset_positions = account_state.get("assetPositions", [])
             position_size = 0.0
             unrealized_pnl = 0.0
             entry_px = 0.0
             liquidation_px = 0.0
 
+            # Check for km:US500 (HIP-3 format) or US500 (regular format)
+            target_coins = [f"km:{SYMBOL}", SYMBOL] if SYMBOL.upper() == "US500" else [SYMBOL]
+            
             for pos in asset_positions:
                 pos_info = pos.get("position", {})
-                if pos_info.get("coin") == "BTC":
+                coin = pos_info.get("coin", "")
+                if coin in target_coins:  # Check both formats
                     position_size = float(pos_info.get("szi", 0))
                     unrealized_pnl = float(pos_info.get("unrealizedPnl", 0))
                     entry_px = float(pos_info.get("entryPx", 0))
@@ -477,7 +517,7 @@ class PerformanceMonitor:
         for pos in asset_positions:
             position_value = abs(float(pos.get("position", {}).get("szi", 0)))
             if position_value > 0.01:  # Large position
-                errors.append(f"LARGE POSITION: {position_value:.5f} BTC")
+                errors.append(f"LARGE POSITION: {position_value:.5f} {SYMBOL}")
 
         return errors
 
@@ -653,7 +693,7 @@ class PerformanceMonitor:
 
             log(
                 "DATA",
-                f"💰 Equity: ${equity:.2f} | Position: {position:+.4f} BTC | Unrealized: ${unrealized:+.2f}",
+                f"💰 Equity: ${equity:.2f} | Position: {position:+.4f} {SYMBOL} | Unrealized: ${unrealized:+.2f}",
             )
             if self.cycle_count > 1:
                 pnl_emoji = "📈" if cycle_pnl >= 0 else "📉"
@@ -859,12 +899,33 @@ def main():
     log("INFO", "🚀 CONTINUOUS MONITORING & AUTO-OPTIMIZATION SYSTEM v2.0")
     print("=" * 80)
     log("INFO", f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log("INFO", f"Symbol: {SYMBOL} (S&P 500 Index Perpetual)")
     log("INFO", "Bot: OPT#14 (Adaptive Anti-Picking-Off) + Weighted Averages")
     log("INFO", "Data: Real-time from Hyperliquid API (2000 fills)")
+    log("INFO", f"Candle Collection: Saving {SYMBOL} 1m candles to data/us500_candles_1m.csv")
     log("INFO", "Monitoring: 5-minute cycles, autonomous optimization")
     log("INFO", "State: Persistent across restarts")
     log("INFO", "Press Ctrl+C to stop")
     print("=" * 80)
+
+    # Start US500 candle collection in background
+    collector = get_collector()
+    collection_task = None
+    loop = None
+    
+    try:
+        # Start async collection in background thread
+        import threading
+        def run_collection():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(collector.collect_continuously())
+        
+        collection_thread = threading.Thread(target=run_collection, daemon=True)
+        collection_thread.start()
+        log("INFO", f"✅ Started {SYMBOL} candle collection (1-minute interval)")
+    except Exception as e:
+        log("WARN", f"Could not start candle collection: {e}")
 
     cycle_interval = 300  # 5 minutes between cycles
     trades_per_cycle_target = 10

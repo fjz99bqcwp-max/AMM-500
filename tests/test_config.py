@@ -27,10 +27,10 @@ class TestTradingConfig:
         config = TradingConfig()
 
         assert config.symbol == "BTC"
-        assert config.leverage == 40  # Updated to match new default
-        assert config.max_net_exposure == 50000.0
-        assert config.collateral == 2500.0
-        assert config.order_levels == 20  # Updated to match new default
+        assert config.leverage == 5  # Conservative default for low DD
+        assert config.max_net_exposure == 250000.0
+        assert config.collateral == 1000.0
+        assert config.order_levels == 18  # Balanced market making
 
     def test_custom_values(self):
         """Test custom trading configuration."""
@@ -55,8 +55,8 @@ class TestRiskConfig:
         assert config.max_drawdown == 0.05  # Updated - tightened to 5%
         assert config.stop_loss_pct == 0.02  # Updated - tightened to 2%
         assert config.min_margin_ratio == 0.15
-        assert config.medium_risk_leverage == 30  # Updated to match new default
-        assert config.low_risk_leverage == 20  # Updated to match new default
+        assert config.medium_risk_leverage == 15  # Conservative medium risk
+        assert config.low_risk_leverage == 10  # Conservative high risk
 
 
 class TestNetworkConfig:

@@ -462,8 +462,19 @@ class MarketMakingStrategy:
                 logger.debug("No recent fills found")
                 return
 
+            # Target symbol for filtering (handle km: prefix for HIP-3 perps)
+            symbol = self.config.trading.symbol.upper()
+            # For US500, API returns "km:US500"
+            target_coin = f"km:{symbol}" if symbol == "US500" else symbol
+
             # Add fills to metrics (this populates recent_buy_prices, recent_sell_prices)
+            synced_count = 0
             for fill in fills:
+                # Filter to only include fills for our trading symbol
+                coin = fill.get("coin", "")
+                if coin != target_coin:
+                    continue
+
                 side = fill.get("side")  # "B" for buy, "A" for sell
                 price = float(fill.get("px", 0))
                 size = float(fill.get("sz", 0))
@@ -476,8 +487,9 @@ class MarketMakingStrategy:
                     continue
 
                 self.metrics.add_fill(order_side, price, size)
+                synced_count += 1
 
-            logger.info(f"Synced {len(fills)} recent fills for OPT#14 adaptive mode")
+            logger.info(f"Synced {synced_count} recent {target_coin} fills for OPT#14 adaptive mode")
 
         except Exception as e:
             logger.error(f"Error syncing recent fills: {e}")
@@ -488,6 +500,17 @@ class MarketMakingStrategy:
 
         This should be called in the main bot loop.
         """
+        # Handle paused state - check if we can resume
+        if self.state == StrategyState.PAUSED:
+            # Check if conditions allow resuming
+            risk_metrics = await self.risk_manager.check_risk()
+            if not risk_metrics.should_pause_trading and not risk_metrics.emergency_close:
+                logger.info("Risk conditions improved, resuming trading...")
+                await self.resume()
+            else:
+                # Still in risk situation - wait
+                return
+        
         if self.state != StrategyState.RUNNING:
             return
 
@@ -584,54 +607,71 @@ class MarketMakingStrategy:
             await self._cancel_all_quotes()
             return
 
+        # DEBUG: Log what we're trying to do
+        notional_value = quote_size * orderbook.mid_price
+        logger.debug(
+            f"Quote size calculated: {quote_size:.8f} contracts at ${orderbook.mid_price:.2f} = "
+            f"${notional_value:.2f} notional (min $10.00)"
+        )
+
         # Build new quote levels
+        logger.debug(f"Building quote levels with base_size={quote_size:.8f}")
         new_bids, new_asks = self._build_quote_levels(bid_price, ask_price, quote_size, spread_bps)
+        logger.debug(f"Built {len(new_bids)} bid levels, {len(new_asks)} ask levels")
 
         # ONE-SIDED QUOTING for inventory rebalancing - SURVIVAL MODE
         # When delta exceeds 15%, only quote on the side that reduces position
         # OPT#15: Lowered from 25% to 15% to prevent deep position accumulation
         if abs(self.inventory.delta) > 0.15:
+            # Calculate minimum size for this symbol
+            # US500: szDecimals=1 means minimum 0.1 contracts (~$69 at $693)
+            mid_price = orderbook.mid_price
+            if self.symbol.upper() == "US500":
+                min_level_size = 0.1  # szDecimals=1 -> minimum 0.1 contracts
+            else:
+                min_level_size = 0.00012  # BTC minimum
+            
             if self.inventory.delta > 0:  # Long position, only quote asks (to sell)
                 new_bids = []
                 # Cancel ALL bids on exchange (not just tracked ones)
                 await self._cancel_all_side("buy")
-                # AGGRESSIVE ASK PLACEMENT: Place asks just $2 above market ask (tight for ALO)
+                # AGGRESSIVE ASK PLACEMENT: Place asks just $0.02 above market ask (tight for ALO)
                 # For rebalancing LONG, we want to SELL so place asks close to BBO
                 aggressive_ask = round_price(
-                    orderbook.best_ask + 2.0, 1.0
-                )  # $2 above BBO (ALO safe)
+                    orderbook.best_ask + 0.02, 0.01
+                )  # $0.02 above BBO (ALO safe, using 0.01 tick)
                 new_asks = [
                     QuoteLevel(
-                        price=aggressive_ask + i * 1.0,  # $1 spacing for tight quotes
-                        size=round_size(quote_size * (1 - i * 0.1), 0.00001),
+                        price=aggressive_ask + i * 0.01,  # $0.01 spacing for tight quotes
+                        size=round_size(max(quote_size * (1 - i * 0.1), min_level_size), 0.1),
                         side=OrderSide.SELL,
                     )
                     for i in range(min(self.order_levels, 6))
-                    if round_size(quote_size * (1 - i * 0.1), 0.00001) >= 0.00012
+                    if round_size(max(quote_size * (1 - i * 0.1), min_level_size), 0.1) >= min_level_size
                 ]
                 logger.info(
-                    f"REBALANCE MODE: ASKS only at ${aggressive_ask:.0f}+ (delta={self.inventory.delta:.2f}, pos={self.inventory.position_size:+.6f})"
+                    f"REBALANCE MODE: ASKS only at ${aggressive_ask:.2f}+ (delta={self.inventory.delta:.2f}, pos={self.inventory.position_size:+.4f})"
                 )
             else:  # Short position, only quote bids (to buy)
                 new_asks = []
                 # Cancel ALL asks on exchange (not just tracked ones)
                 await self._cancel_all_side("sell")
-                # AGGRESSIVE BID PLACEMENT: Place bids just $2 below best bid (tight for ALO)
+                # AGGRESSIVE BID PLACEMENT: Place bids just $0.02 below best bid (tight for ALO)
                 # For rebalancing SHORT, we want to BUY so place bids close to BBO
                 aggressive_bid = round_price(
-                    orderbook.best_bid - 2.0, 1.0
-                )  # $2 below BBO (ALO safe)
+                    orderbook.best_bid - 0.02, 0.01
+                )  # $0.02 below BBO (ALO safe, using 0.01 tick)
                 new_bids = [
                     QuoteLevel(
-                        price=aggressive_bid - i * 1.0,  # $1 spacing for tight quotes
-                        size=round_size(quote_size * (1 - i * 0.1), 0.00001),
+                        price=aggressive_bid - i * 0.01,  # $0.01 spacing for tight quotes
+                        size=round_size(max(quote_size * (1 - i * 0.1), min_level_size), 0.1),
                         side=OrderSide.BUY,
                     )
                     for i in range(min(self.order_levels, 6))
-                    if round_size(quote_size * (1 - i * 0.1), 0.00001) >= 0.00012
+                    if round_size(max(quote_size * (1 - i * 0.1), min_level_size), 0.1) >= min_level_size
                 ]
                 logger.info(
-                    f"REBALANCE MODE: BIDS only at ${aggressive_bid:.0f}- (delta={self.inventory.delta:.2f}, pos={self.inventory.position_size:+.6f})"
+                    f"REBALANCE MODE: BIDS only at ${aggressive_bid:.2f}- (delta={self.inventory.delta:.2f}, pos={self.inventory.position_size:+.4f})"
                 )
 
         # Update orders
@@ -788,46 +828,52 @@ class MarketMakingStrategy:
                 bid_price = base_bid
                 ask_price = base_ask
         # OPTIMIZATION #17: ENHANCED ADAPTIVE ANTI-PICKING-OFF
-        # Reduced defensive triggers, added aggressive mode for >+10 bps
+        # Use bps-based distances that scale with price (not fixed dollar amounts)
+        # For US500 at $693: 10 bps = $0.69, 20 bps = $1.39
+        # For BTC at $90000: 10 bps = $9.00, 20 bps = $18.00
         recent_spread = self.metrics.get_recent_spread_bps()
         if recent_spread is not None:
-            if recent_spread < -3.0:  # More negative threshold for defensive
-                defensive_distance = 8.0  # $8 behind BBO (reduced from $10)
+            if recent_spread < -3.0:  # Severe adverse selection
+                defensive_bps = 30.0  # 30 bps behind BBO (was $8 = 115 bps for US500!)
                 self.order_levels = 1  # Only 1 level
                 logger.debug(
-                    f"OPT#17 DEFENSIVE: spread {recent_spread:.2f} bps → $8 distance, 1 level"
+                    f"OPT#17 DEFENSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 1 level"
                 )
             elif recent_spread < 1.0:  # Low profit threshold
-                defensive_distance = 4.0  # $4 behind BBO (reduced from $5)
+                defensive_bps = 15.0  # 15 bps behind BBO
                 self.order_levels = 2  # 2 levels
                 logger.debug(
-                    f"OPT#17 CAUTIOUS: spread {recent_spread:.2f} bps → $4 distance, 2 levels"
+                    f"OPT#17 CAUTIOUS: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 2 levels"
                 )
             elif recent_spread > 10.0:  # NEW: Aggressive mode for very profitable spreads
-                defensive_distance = 1.0  # $1 behind BBO (aggressive)
+                defensive_bps = 3.0  # 3 bps behind BBO (tight)
                 self.order_levels = 5  # 5 levels for more liquidity
                 logger.debug(
-                    f"OPT#17 AGGRESSIVE: spread {recent_spread:.2f} bps → $1 distance, 5 levels"
+                    f"OPT#17 AGGRESSIVE: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 5 levels"
                 )
             else:  # Normal profitable range
-                defensive_distance = 2.0  # $2 behind BBO (reduced from $3)
+                defensive_bps = 8.0  # 8 bps behind BBO
                 self.order_levels = 3  # 3 levels
                 logger.debug(
-                    f"OPT#17 NORMAL: spread {recent_spread:.2f} bps → $2 distance, 3 levels"
+                    f"OPT#17 NORMAL: spread {recent_spread:.2f} bps → {defensive_bps:.0f} bps distance, 3 levels"
                 )
         else:
             # Default when insufficient data
-            defensive_distance = 2.0
+            defensive_bps = 8.0  # 8 bps
             self.order_levels = min(self.config.trading.order_levels, 3)
-            logger.debug("OPT#17 DEFAULT: insufficient data → $2 distance")
+            logger.debug(f"OPT#17 DEFAULT: insufficient data → {defensive_bps:.0f} bps distance")
+        
+        # Convert bps to dollar distance
+        defensive_distance = mid * (defensive_bps / 10000.0)
 
         # Apply defensive distance - quote BEHIND BBO
         bid_price = max(base_bid, orderbook.best_bid - defensive_distance)
         ask_price = min(base_ask, orderbook.best_ask + defensive_distance)
 
-        # Round to tick size ($1 for BTC)
-        bid_price = round_price(bid_price, 1.0)
-        ask_price = round_price(ask_price, 1.0)
+        # Round to tick size: $0.01 for US500, $1 for BTC
+        tick_size = 0.01 if self.symbol.upper() == "US500" else 1.0
+        bid_price = round_price(bid_price, tick_size)
+        ask_price = round_price(ask_price, tick_size)
 
         # ENSURE MINIMUM SPREAD - OPT#13: 8 bps minimum
         min_spread_dollars = mid * (max(self.min_spread_bps, 8.0) / 10000)
@@ -835,45 +881,13 @@ class MarketMakingStrategy:
             gap = min_spread_dollars - (ask_price - bid_price)
             bid_price -= gap / 2
             ask_price += gap / 2
-            bid_price = round_price(bid_price, 1.0)
-            ask_price = round_price(ask_price, 1.0)
+            bid_price = round_price(bid_price, tick_size)
+            ask_price = round_price(ask_price, tick_size)
 
         # OPTIMIZATION #14: ADAPTIVE DEFENSIVE DISTANCE
-        # Monitor recent fill performance and adjust defensive distance
-        # - If recent spreads are negative: INCREASE distance to $4-6
-        # - If recent spreads are positive: Keep normal distance of $2-3
-        # - This prevents getting picked off during adverse conditions
-
-        recent_spread = self.metrics.get_recent_spread_bps()
-
-        if recent_spread is not None and recent_spread < -5.0:
-            # Severe adverse selection (< -5 bps) = trending market
-            # OPT#16: Increased from $7 to $10 for maximum protection
-            defensive_distance = 10.0  # Maximum distance during trends
-            logger.warning(
-                f"SEVERE ADVERSE SELECTION: spread={recent_spread:.2f} bps, "
-                f"defensive distance ${defensive_distance:.0f} (trend likely)"
-            )
-        elif recent_spread is not None and recent_spread < -2.0:
-            # Moderate adverse selection
-            # OPT#16: Increased from $7 to $8
-            defensive_distance = 8.0  # Strong protection
-            logger.warning(
-                f"ADVERSE SELECTION detected: recent spread={recent_spread:.2f} bps, "
-                f"increasing defensive distance to ${defensive_distance:.0f}"
-            )
-        elif recent_spread is not None and recent_spread < 2.0:
-            # Marginally profitable or breaking even
-            # OPT#16: Increased from $4.5 to $5.5 for better protection
-            defensive_distance = 5.5  # Moderate distance
-            logger.info(
-                f"Low profitability: recent spread={recent_spread:.2f} bps, "
-                f"using defensive distance ${defensive_distance:.1f}"
-            )
-        else:
-            # Good profitability or no data yet
-            # OPT#16: Increased from $2.0 to $3.0 base distance
-            defensive_distance = 3.0  # Standard distance
+        # Distance is already set above based on recent spread (OPT#17)
+        # This section just applies the distance - no need to recalculate
+        # Note: defensive_distance was set in lines 820-850 based on spread profitability
 
         if orderbook.best_bid > 0:
             # Our bid should be BELOW best bid by defensive_distance
@@ -890,8 +904,9 @@ class MarketMakingStrategy:
         # Final validation - never cross the spread
         if bid_price >= ask_price:
             mid_point = (bid_price + ask_price) / 2
-            bid_price = round_price(mid_point - 3.0, 1.0)
-            ask_price = round_price(mid_point + 3.0, 1.0)
+            min_half_spread = mid * 0.0005  # 5 bps minimum spread
+            bid_price = round_price(mid_point - min_half_spread, tick_size)
+            ask_price = round_price(mid_point + min_half_spread, tick_size)
 
         # Calculate actual spread in bps for logging
         actual_spread_bps = (ask_price - bid_price) / mid * 10000
@@ -935,8 +950,12 @@ class MarketMakingStrategy:
         mid = (bid_price + ask_price) / 2
         level_spacing = mid * (spread_bps / 10000) * 0.5  # Half spread per level
 
-        # Hyperliquid requires $10 minimum notional value
-        min_size = max(0.00012, 10.5 / mid)  # $10.50 notional for safety
+        # US500: szDecimals=1 means minimum size is 0.1 contracts (~$69 at $693)
+        # Other symbols use the standard $10 notional minimum
+        if self.symbol.upper() == "US500":
+            min_size = 0.1  # szDecimals=1 -> minimum 0.1 contracts
+        else:
+            min_size = max(0.00012, 10.5 / mid)  # $10.50 notional for safety
 
         # OPTIMIZATION #4: Ensure base_size is scaled to allow all levels
         # With 15% pyramiding reduction, level 2 is 70% of base
@@ -953,33 +972,47 @@ class MarketMakingStrategy:
                 f"Scaled base_size {base_size:.6f} → {effective_base:.6f} to meet min_size {min_size:.6f}"
             )
 
+        # Get lot size for this symbol (US500: 0.1, BTC: 0.00001)
+        if self.symbol.upper() == "US500":
+            lot_size = 0.1  # szDecimals=1
+            tick_size = 0.01  # US500 uses $0.01 tick size
+        else:
+            lot_size = 0.00001  # BTC
+            tick_size = 1.0  # BTC uses $1 tick size
+
         for i in range(effective_levels):  # Use effective_levels instead of self.order_levels
             # Decrease size for outer levels (pyramiding)
             level_size = effective_base * (1 - i * 0.15)
-            # Skip if below minimum notional requirement (safety check)
+            # Skip if below minimum size requirement (safety check)
             if level_size < min_size:
                 logger.warning(f"Level {i} size {level_size:.6f} < min {min_size:.6f} - skipping")
                 continue
 
-            # Bid levels (decreasing prices) - BTC tick is $1.0
-            bid_level_price = round_price(bid_price - i * level_spacing, 1.0)
+            # Bid levels (decreasing prices)
+            bid_level_price = round_price(bid_price - i * level_spacing, tick_size)
             bids.append(
                 QuoteLevel(
                     price=bid_level_price,
-                    size=round_size(level_size, 0.00001),
+                    size=round_size(level_size, lot_size),
                     side=OrderSide.BUY,
                 )
             )
 
-            # Ask levels (increasing prices) - BTC tick is $1.0
-            ask_level_price = round_price(ask_price + i * level_spacing, 1.0)
+            # Ask levels (increasing prices)
+            ask_level_price = round_price(ask_price + i * level_spacing, tick_size)
             asks.append(
                 QuoteLevel(
                     price=ask_level_price,
-                    size=round_size(level_size, 0.00001),
+                    size=round_size(level_size, lot_size),
                     side=OrderSide.SELL,
                 )
             )
+
+        # Debug logging
+        if bids:
+            logger.debug(f"Bid levels: {[(b.price, b.size, b.size*b.price) for b in bids]}")
+        if asks:
+            logger.debug(f"Ask levels: {[(a.price, a.size, a.size*a.price) for a in asks]}")
 
         return bids, asks
 

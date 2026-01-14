@@ -630,7 +630,6 @@ def main() -> None:
             plot=True,
             monte_carlo=True,
             num_processes=num_cores,
-            symbol="US500",  # Specify US500 for data loading
         )
 
     elif args.status:

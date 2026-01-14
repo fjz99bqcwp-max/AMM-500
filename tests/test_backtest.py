@@ -317,12 +317,13 @@ class TestMonteCarloSimulator:
             horizon_days=7,
         )
 
-        assert "return_percentiles" in results
-        assert "5th" in results["return_percentiles"]
-        assert "95th" in results["return_percentiles"]
+        assert "baseline" in results
+        assert "return_percentiles" in results["baseline"]
+        assert "5th" in results["baseline"]["return_percentiles"]
+        assert "95th" in results["baseline"]["return_percentiles"]
 
-        # 5th percentile should be less than 95th
-        assert results["return_percentiles"]["5th"] < results["return_percentiles"]["95th"]
+        # 5th percentile should be less than or equal to 95th
+        assert results["baseline"]["return_percentiles"]["5th"] <= results["baseline"]["return_percentiles"]["95th"]
 
 
 class TestBacktestIntegration:

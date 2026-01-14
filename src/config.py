@@ -33,14 +33,14 @@ class TradingConfig:
     - Best for ROI: Lev=10, Spread=3bps, Fill=0.95, Levels=10
     """
 
-    symbol: str = "BTC"  # Bitcoin perpetual on Hyperliquid (most liquid market)
-    leverage: int = 5  # Conservative - optimized for low DD
-    max_net_exposure: float = 250000.0  # Higher exposure for crypto vs index
+    symbol: str = "US500"  # US500 perpetual on Hyperliquid (km:US500)
+    leverage: int = 10  # Conservative for index (max 25x)
+    max_net_exposure: float = 25000.0  # Lower exposure for index vs crypto
     collateral: float = 1000.0  # Starting collateral for paper trading
-    min_spread_bps: float = 4.0  # Balanced spread (verified via backtest)
-    max_spread_bps: float = 15.0  # Max spread at high volatility
-    order_size_fraction: float = 0.015  # Smaller orders for lower DD
-    order_levels: int = 18  # 18 levels for balanced market making
+    min_spread_bps: float = 1.0  # Tighter spread for US500 (lower vol)
+    max_spread_bps: float = 50.0  # Max spread at high volatility
+    order_size_fraction: float = 0.02  # 2% per order for index
+    order_levels: int = 20  # 20 levels for aggressive market making
     fill_rate: float = 0.75  # Moderate fill rate (verified via backtest)
 
 

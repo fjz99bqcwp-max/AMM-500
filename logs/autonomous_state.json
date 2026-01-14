@@ -1,0 +1,367 @@
+{
+  "cycle_count": 38,
+  "bot_restarts": 5,
+  "last_fill_time": 1768287995400,
+  "last_cycle": "2026-01-14T07:20:43.578799",
+  "performance_history": [
+    {
+      "cycle": 38,
+      "timestamp": "2026-01-14T07:20:43.567149",
+      "spread_bps": 0,
+      "net_pnl": 0,
+      "cycle_pnl": 860.49199699,
+      "session_pnl": 860.49199699,
+      "session_pnl_pct": 25190046.750292737,
+      "equity": 860.49541299,
+      "mode": "MODERATE",
+      "urgency": "MEDIUM"
+    }
+  ],
+  "starting_balance": 0.003416,
+  "last_balance": 860.49541299,
+  "balance_history": [
+    {
+      "timestamp": "2026-01-13T06:29:31.600179",
+      "cycle": 1,
+      "equity": 0.003416,
+      "cycle_change": 0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T06:51:07.257281",
+      "cycle": 2,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T06:56:10.200435",
+      "cycle": 3,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:01:13.471673",
+      "cycle": 4,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:06:17.297082",
+      "cycle": 5,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:11:21.042872",
+      "cycle": 6,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:16:24.022703",
+      "cycle": 7,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:21:26.934472",
+      "cycle": 8,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:22:11.539869",
+      "cycle": 9,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:22:34.465370",
+      "cycle": 10,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:27:37.393525",
+      "cycle": 11,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:31:44.377507",
+      "cycle": 12,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:36:55.392183",
+      "cycle": 13,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:41:58.385916",
+      "cycle": 14,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:43:31.057059",
+      "cycle": 15,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:48:34.138115",
+      "cycle": 16,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:53:36.936949",
+      "cycle": 17,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T07:58:48.063555",
+      "cycle": 18,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:03:51.541469",
+      "cycle": 19,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:08:54.685011",
+      "cycle": 20,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:13:57.658797",
+      "cycle": 21,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:19:00.498059",
+      "cycle": 22,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:24:03.447914",
+      "cycle": 23,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:27:41.443240",
+      "cycle": 24,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:28:50.124375",
+      "cycle": 25,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:31:09.279466",
+      "cycle": 26,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:36:12.152887",
+      "cycle": 27,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:41:15.514447",
+      "cycle": 28,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:43:37.562440",
+      "cycle": 29,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-13T08:43:47.206715",
+      "cycle": 30,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-14T05:16:27.668601",
+      "cycle": 31,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-14T05:17:13.350846",
+      "cycle": 32,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-14T05:17:18.068138",
+      "cycle": 33,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-14T05:18:25.324374",
+      "cycle": 34,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-14T07:08:45.510157",
+      "cycle": 35,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-14T07:13:56.468484",
+      "cycle": 36,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-14T07:18:59.351742",
+      "cycle": 37,
+      "equity": 0.003416,
+      "cycle_change": 0.0,
+      "session_pnl": 0.0,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "timestamp": "2026-01-14T07:20:43.565928",
+      "cycle": 38,
+      "equity": 860.49541299,
+      "cycle_change": 860.49199699,
+      "session_pnl": 860.49199699,
+      "position_size": 0.0,
+      "unrealized_pnl": 0.0
+    }
+  ],
+  "session_pnl": 860.49199699
+}

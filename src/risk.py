@@ -527,16 +527,30 @@ class RiskManager:
 
         # Set action flags
         metrics.should_reduce_exposure = metrics.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
-        metrics.should_pause_trading = metrics.risk_level == RiskLevel.CRITICAL
+        
+        # Only pause trading if CRITICAL AND we have a position to protect
+        # For market-making with no position, we should keep quoting
+        has_position = position is not None and abs(position.size) > 0.0001
+        metrics.should_pause_trading = metrics.risk_level == RiskLevel.CRITICAL and has_position
 
-        # Emergency close if margin is critically low or drawdown exceeded
-        if (
+        # Emergency close only if we have a position AND:
+        # - margin is critically low, OR
+        # - drawdown severely exceeded, OR  
+        # - margin ratio dangerously high
+        if has_position and (
             metrics.distance_to_liquidation < 0.03
-            or metrics.current_drawdown > self.max_drawdown * 1.2
+            or metrics.current_drawdown > self.max_drawdown * 1.5  # Increased from 1.2 to 1.5
             or metrics.margin_ratio > 0.9
         ):
             metrics.emergency_close = True
             metrics.should_pause_trading = True
+        
+        # NEVER emergency close when we have no position - just log a warning
+        if not has_position and metrics.current_drawdown > self.max_drawdown:
+            logger.warning(
+                f"Drawdown {metrics.current_drawdown:.2%} exceeds threshold {self.max_drawdown:.2%} "
+                f"but no position - continuing to quote"
+            )
 
         return metrics
 
@@ -637,13 +651,27 @@ class RiskManager:
 
         # Cap based on max exposure
         max_position_usd = self.config.trading.max_net_exposure
-        max_size = max_position_usd / price
+        max_size = max_position_usd / price if price > 0 else 0
 
-        # Minimum size floor - Hyperliquid requires $10 minimum notional
-        # At $100k BTC, min is 0.0001; at $50k, min is 0.0002
-        min_size = max(0.00012, 10.0 / price)  # Ensures $10+ notional
+        # Minimum size floor based on symbol's szDecimals
+        # US500: szDecimals=1 -> minimum 0.1 contracts (~$69 at $693)
+        # BTC: szDecimals=4 -> minimum 0.0001 BTC (~$10 at $100k)
+        symbol = self.config.trading.symbol.upper()
+        if symbol == "US500":
+            min_size = 0.1  # szDecimals=1 -> 10^(-1) = 0.1 contracts
+        else:
+            min_size = max(0.00012, 10.0 / price) if price > 0 else 0.00012  # Ensures $10+ notional
 
-        return max(min_size, min(kelly_size, max_size))
+        final_size = max(min_size, min(kelly_size, max_size))
+        
+        # Log sizing details (only when size is near minimum to avoid spam)
+        if final_size == min_size:
+            logger.debug(
+                f"Order size capped at minimum: {final_size:.6f} (kelly={kelly_size:.6f}, "
+                f"min={min_size:.6f}, max={max_size:.6f}, price=${price:.2f})"
+            )
+        
+        return final_size
 
     def _calculate_kelly_dynamic_size(
         self, price: float, metrics: Optional[RiskMetrics] = None, funding_rate: float = 0.0

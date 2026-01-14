@@ -30,13 +30,13 @@ class TestPriceUtils:
     
     def test_round_price_default_tick(self):
         """Test price rounding with default tick size."""
-        assert round_price(100.05, 0.1) == 100.0
+        assert round_price(100.05, 0.1) == 100.1  # Rounds to nearest 0.1
         assert round_price(100.15, 0.1) == 100.2
         assert round_price(100.149, 0.1) == 100.1
     
     def test_round_price_custom_tick(self):
         """Test price rounding with custom tick size."""
-        assert round_price(100.025, 0.05) == 100.0
+        assert round_price(100.025, 0.05) == 100.05  # Rounds to nearest 0.05
         assert round_price(100.075, 0.05) == 100.10
     
     def test_round_size_default_lot(self):

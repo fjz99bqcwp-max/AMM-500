@@ -234,9 +234,30 @@ class HyperliquidClient:
     # US500 prices use $0.01 tick size (index points with 2 decimals)
     # Order sizing parameters
     # For BTC perpetual: min size is 0.0001 BTC
-    # For US500 futures: min size is 0.01 contracts
+    # For US500 futures: szDecimals=1 means min size is 0.1 contracts
     TICK_SIZE = 0.01
-    LOT_SIZE = 0.0001  # 0.0001 BTC minimum for BTC perpetual (was 0.01 for US500)
+    LOT_SIZE = 0.0001  # Default: 0.0001 BTC minimum for BTC perpetual
+    
+    # Symbol-specific lot sizes based on szDecimals from Hyperliquid API
+    # szDecimals defines the precision: 10^(-szDecimals) is the minimum increment
+    SYMBOL_LOT_SIZES = {
+        "US500": 0.1,    # szDecimals=1 -> 10^(-1) = 0.1
+        "SPX": 0.1,      # Same asset, different name
+        "BTC": 0.0001,   # szDecimals=4 -> 10^(-4) = 0.0001
+        "ETH": 0.001,    # szDecimals=3 -> 10^(-3) = 0.001
+    }
+    
+    def _get_lot_size(self, symbol: str) -> float:
+        """Get the minimum lot size for a symbol based on szDecimals."""
+        sym = symbol.upper().replace("KM:", "")
+        return self.SYMBOL_LOT_SIZES.get(sym, self.LOT_SIZE)
+
+    def _get_api_symbol(self, symbol: str) -> str:
+        """Convert symbol to API format for HIP-3 perps."""
+        # HIP-3 perps like US500 need km: prefix for API calls
+        if symbol.upper() == "US500":
+            return f"km:{symbol}"
+        return symbol
 
     def __init__(self, config: Config):
         """Initialize the client."""
@@ -375,8 +396,11 @@ class HyperliquidClient:
             wallet = Account.from_key(self.config.private_key)
 
             base_url = self.config.network.api_url
+            
+            # Include HIP-3 perp DEXs (km for km:US500)
+            perp_dexs = ['km'] if self.config.trading.symbol.upper() == 'US500' else None
 
-            self._info = Info(base_url=base_url, skip_ws=True)
+            self._info = Info(base_url=base_url, skip_ws=True, perp_dexs=perp_dexs)
 
             # If the wallet address differs from the private key's address,
             # we're using an API wallet and need to specify account_address
@@ -392,12 +416,14 @@ class HyperliquidClient:
                     wallet=wallet,
                     base_url=base_url,
                     account_address=self.config.wallet_address,
+                    perp_dexs=perp_dexs,
                 )
             else:
                 # Using main wallet directly
                 self._exchange = Exchange(
                     wallet=wallet,
                     base_url=base_url,
+                    perp_dexs=perp_dexs,
                 )
 
             # Set leverage (may fail if wallet not yet funded on testnet)
@@ -711,19 +737,32 @@ class HyperliquidClient:
         self._order_latency.start()
 
         try:
+            # Get symbol-specific lot size
+            lot_size = self._get_lot_size(request.symbol)
+            
             # Round price and size
             price = round_price(request.price, self.TICK_SIZE) if request.price else None
-            size = round_size(request.size, self.LOT_SIZE)
+            size = round_size(request.size, lot_size)
 
-            if size < self.LOT_SIZE:
-                logger.warning(f"Order size {request.size} too small, minimum is {self.LOT_SIZE}")
-                return None
+            # For HIP-3 perps (US500), szDecimals=1 means min size is 0.1 contracts
+            if request.symbol.upper() == "US500":
+                min_size = 0.1  # szDecimals=1 -> 10^(-1) = 0.1
+                if size < min_size:
+                    logger.warning(
+                        f"Order size {size:.4f} < min {min_size} for US500 - rejecting"
+                    )
+                    return None
+            else:
+                if size < lot_size:
+                    logger.warning(f"Order size {request.size} too small, minimum is {lot_size}")
+                    return None
 
-            # Build order
+            # Build order with API symbol (km: prefix for HIP-3 perps)
+            api_symbol = self._get_api_symbol(request.symbol)
             is_buy = request.side == OrderSide.BUY
 
             order_result = self._exchange.order(
-                coin=request.symbol,
+                coin=api_symbol,
                 is_buy=is_buy,
                 sz=size,
                 limit_px=price,
@@ -832,15 +871,31 @@ class HyperliquidClient:
             # Build batch orders
             orders_data = []
             for req in requests:
+                # Get symbol-specific lot size
+                lot_size = self._get_lot_size(req.symbol)
+                
                 price = round_price(req.price, self.TICK_SIZE) if req.price else 0.0
-                size = round_size(req.size, self.LOT_SIZE)
+                size = round_size(req.size, lot_size)
 
-                if size < self.LOT_SIZE:
-                    continue
+                # For HIP-3 perps (US500), szDecimals=1 means min size is 0.1 contracts
+                # At $693 price, that's $69.30 minimum notional
+                if req.symbol.upper() == "US500":
+                    min_size = 0.1  # szDecimals=1 -> 10^(-1) = 0.1
+                    if size < min_size:
+                        logger.warning(
+                            f"Order REJECTED: size={size:.4f} < min={min_size} for US500"
+                        )
+                        continue
+                else:
+                    if size < lot_size:
+                        continue
 
+                # Use API symbol (km: prefix for HIP-3 perps)
+                api_symbol = self._get_api_symbol(req.symbol)
+                
                 orders_data.append(
                     {
-                        "coin": req.symbol,
+                        "coin": api_symbol,
                         "is_buy": req.side == OrderSide.BUY,
                         "sz": size,
                         "limit_px": price,
@@ -972,13 +1027,24 @@ class HyperliquidClient:
 
         orders = []
         for req in requests:
+            # Get symbol-specific lot size
+            lot_size = self._get_lot_size(req.symbol)
+            
             price = round_price(req.price, self.TICK_SIZE) if req.price else 0.0
-            size = round_size(req.size, self.LOT_SIZE)
+            size = round_size(req.size, lot_size)
 
-            if size < self.LOT_SIZE:
-                logger.warning(f"[PAPER] Order size {size:.8f} too small (min={self.LOT_SIZE})")
-                orders.append(None)
-                continue
+            # For HIP-3 perps (US500), szDecimals=1 means min size is 0.1 contracts
+            if req.symbol.upper() == "US500":
+                min_size = 0.1  # szDecimals=1 -> 10^(-1) = 0.1
+                if size < min_size:
+                    logger.warning(f"[PAPER] Order size {size:.4f} < min {min_size} for US500")
+                    orders.append(None)
+                    continue
+            else:
+                if size < lot_size:
+                    logger.warning(f"[PAPER] Order size {size:.8f} too small (min={lot_size})")
+                    orders.append(None)
+                    continue
 
             # Generate simulated order ID
             order_id = f"sim_{uuid.uuid4().hex[:12]}"
@@ -1371,8 +1437,10 @@ class HyperliquidClient:
             # Build cancel requests for bulk_cancel
             from hyperliquid.utils.signing import CancelRequest
 
+            # Use API symbol format (km: prefix for HIP-3 perps)
+            api_symbol = self._get_api_symbol(coin)
             cancel_requests = [
-                CancelRequest(coin=order.symbol, oid=int(order.order_id))
+                CancelRequest(coin=api_symbol, oid=int(order.order_id))
                 for order in orders_to_cancel
             ]
 
@@ -1412,14 +1480,20 @@ class HyperliquidClient:
             return False
 
         try:
+            # For HIP-3 perps (US500), use km: prefix for API calls
+            api_symbol = f"km:{symbol}" if symbol.upper() == "US500" else symbol
+            
+            # HIP-3 perps use isolated margin, core perps can use cross
+            is_cross = symbol.upper() != "US500"
+            
             result = self._exchange.update_leverage(
                 leverage=leverage,
-                name=symbol,  # SDK uses 'name' parameter
-                is_cross=True,  # Cross margin
+                name=api_symbol,  # SDK uses 'name' parameter
+                is_cross=is_cross,  # HIP-3 uses isolated margin
             )
 
             if isinstance(result, dict) and result.get("status") == "ok":
-                logger.info(f"Set leverage to {leverage}x for {symbol}")
+                logger.info(f"Set leverage to {leverage}x for {symbol} (isolated={not is_cross})")
                 return True
             elif isinstance(result, str):
                 # String response - SDK sometimes returns string on success
@@ -1564,9 +1638,31 @@ class HyperliquidClient:
                 )
 
             # Update local cache
+            perps_equity = float(margin.get("accountValue", 0))
+            perps_available = float(margin.get("withdrawable", 0))
+            
+            # For HIP-3 perps (km:US500), also check Spot USDH balance
+            # USDH in Spot can be used as margin for HIP-3 perps
+            spot_usdh = 0.0
+            if self.config.trading.symbol.upper() == "US500":
+                try:
+                    spot_state = self._info.spot_user_state(self.config.wallet_address)
+                    for b in spot_state.get("balances", []):
+                        if b.get("coin") == "USDH":
+                            spot_usdh = float(b.get("total", 0))
+                            break
+                    if spot_usdh > 0 and perps_equity == 0:
+                        logger.info(f"HIP-3: Found ${spot_usdh:.2f} USDH in Spot (usable as margin)")
+                except Exception as e:
+                    logger.debug(f"Could not check Spot USDH: {e}")
+            
+            # Use Spot USDH as equity if no Perps balance (HIP-3 uses Spot USDH as margin)
+            total_equity = perps_equity + spot_usdh
+            total_available = perps_available + spot_usdh
+            
             self._account_state = AccountState(
-                equity=float(margin.get("accountValue", 0)),
-                available_balance=float(margin.get("withdrawable", 0)),
+                equity=total_equity,
+                available_balance=total_available,
                 margin_used=float(margin.get("totalMarginUsed", 0)),
                 unrealized_pnl=float(margin.get("totalUnrealizedPnl", 0)),
                 positions=positions,
@@ -1656,7 +1752,14 @@ class HyperliquidClient:
             return None
 
         try:
-            book = self._info.l2_snapshot(name=symbol)  # SDK uses 'name' parameter
+            # For HIP-3 perps (US500), use km: prefix for API calls
+            api_symbol = f"km:{symbol}" if symbol.upper() == "US500" else symbol
+            
+            # Use direct POST for HIP-3 perps (l2_snapshot doesn't work with km: prefix)
+            if symbol.upper() == "US500":
+                book = self._info.post("/info", {"type": "l2Book", "coin": api_symbol})
+            else:
+                book = self._info.l2_snapshot(name=symbol)
 
             if book:
                 levels = book.get("levels", [[], []])
