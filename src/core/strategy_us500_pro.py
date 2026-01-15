@@ -280,13 +280,17 @@ class US500ProfessionalMM:
     MAKER_REBATE = 0.00003  # 0.003%
     TAKER_FEE = 0.00035  # 0.035%
     
-    # Professional MM parameters
-    QUOTE_REFRESH_INTERVAL = 1.0  # 1s for HFT
-    MIN_ORDER_AGE_SECONDS = 5.0  # Cancel stale orders >5s
-    MAX_LEVELS_PER_SIDE = 15  # Concentrated liquidity
+    # Professional MM parameters - MODIFIED FOR 200 ORDERS
+    QUOTE_REFRESH_INTERVAL = 2.0  # 2s for stability with 200 orders
+    MIN_ORDER_AGE_SECONDS = 30.0  # Keep orders longer - memorize until filled or replaced
+    MAX_LEVELS_PER_SIDE = 100  # 100 bids + 100 asks = 200 total
     MIN_BOOK_DEPTH_USD = 5000  # US500 threshold
     ADVERSE_SELECTION_THRESHOLD = 3  # Consecutive losing fills
-    BOOK_MOVE_THRESHOLD = 0.001  # 0.1% book move triggers cancel/replace
+    BOOK_MOVE_THRESHOLD = 0.005  # 0.5% book move triggers cancel/replace (less aggressive)
+    MAX_TOTAL_ORDERS = 200  # CRITICAL: Support 200 orders (100 bids + 100 asks)
+    ORDER_CLEANUP_INTERVAL = 60.0  # Cleanup every 60s
+    MAX_NOTIONAL_PER_SIDE = 10000.0  # $10,000 max per side
+    FIXED_RANGE_PCT = 0.02  # ±2% fixed range
     
     def __init__(self, config: Config, client: HyperliquidClient, risk_manager: RiskManager):
         """Initialize strategy."""
@@ -329,14 +333,19 @@ class US500ProfessionalMM:
         self.last_funding_check = 0.0
         self._last_inventory_refresh = 0.0
         self._last_order_sync = 0.0
+        self._last_order_cleanup = 0.0  # Track periodic cleanup
         
-        # Config shortcuts
+        # Config shortcuts - MODIFIED FOR 200 ORDERS
         self.symbol = "US500"  # Hardcoded for US500-USDH
-        self.min_spread_bps = 1.0  # US500 tight spread
-        self.max_spread_bps = 50.0
-        self.order_levels = 15  # Concentrated liquidity
-        self.quote_interval = 1.0
-        self.rebalance_interval = 1.0  # 1s fast rebalance
+        self.min_spread_bps = 1.0  # Start at 1 bps
+        self.max_spread_bps = 200.0  # ±2% = 200 bps
+        self.order_levels = 100  # 100 levels per side
+        self.quote_interval = 2.0  # Slower refresh with 200 orders
+        self.rebalance_interval = 2.0  # 2s rebalance
+        
+        # Order memorization tracking
+        self._order_memory: Dict[str, QuoteLevel] = {}  # All orders ever placed
+        self._filled_orders: Dict[str, float] = {}  # oid -> fill_time
         
         # PyTorch vol predictor
         self.vol_predictor = None
@@ -353,7 +362,7 @@ class US500ProfessionalMM:
         self.client.on_user_update(self._on_user_update)
         
         # Trade tracker
-        from .trade_tracker import get_tracker
+        from src.trade_tracker import get_tracker
         self.trade_tracker = get_tracker(config.wallet_address, self.symbol)
     
     # =========================================================================
@@ -463,7 +472,7 @@ class US500ProfessionalMM:
                 self._last_inventory_refresh = now
             
             # Get risk metrics
-            risk_metrics = await self.risk_manager.assess_risk()
+            risk_metrics = await self.risk_manager.check_risk()
             
             # Check if trading should be paused
             if risk_metrics.should_pause_trading:
@@ -481,6 +490,11 @@ class US500ProfessionalMM:
             if now - self._last_order_sync > 30.0:
                 await self._sync_active_orders()
                 self._last_order_sync = now
+            
+            # Periodic order cleanup (every 30s)
+            if now - self._last_order_cleanup > self.ORDER_CLEANUP_INTERVAL:
+                await self._enforce_order_limits()
+                self._last_order_cleanup = now
             
             # Update quotes (every 1s)
             await self._update_quotes(risk_metrics)
@@ -752,84 +766,83 @@ class US500ProfessionalMM:
         total_size: float
     ) -> Tuple[List[QuoteLevel], List[QuoteLevel]]:
         """
-        Build exponentially tiered quotes with adaptive sizing.
+        Build 100 levels per side with ±2% range.
         
-        PROFESSIONAL MM DISTRIBUTION:
-        - Levels 1-5: 1-5 bps, 70% of volume (tight for fills)
-        - Levels 6-10: 5-15 bps, 20% of volume
-        - Levels 11-15: 15-50 bps, 10% of volume (tail risk)
-        
-        Sizing: Exponential decay (70% in top 5)
-        Spreads: Exponential expansion (min → max)
+        MODIFIED FOR 200 ORDERS:
+        - 100 bids from mid-2% to mid
+        - 100 asks from mid to mid+2%
+        - Total notional: $10,000 per side ($20,000 total)
+        - Linear spacing across ±2% range
+        - Uniform sizing to hit $10k limit
         """
         if not orderbook.mid_price or not orderbook.best_bid or not orderbook.best_ask:
+            logger.warning(f"Orderbook incomplete: mid={orderbook.mid_price}, bid={orderbook.best_bid}, ask={orderbook.best_ask}")
             return [], []
         
         mid = orderbook.mid_price
         bids = []
         asks = []
         
-        # Get inventory skew
-        bid_skew, ask_skew = self._calculate_inventory_skew()
+        # Fixed ±2% range
+        range_pct = self.FIXED_RANGE_PCT
+        bid_start = mid * (1 - range_pct)  # -2%
+        ask_end = mid * (1 + range_pct)    # +2%
         
-        # Number of levels (max 15)
-        total_levels = min(self.MAX_LEVELS_PER_SIDE, self.order_levels)
+        # Number of levels per side
+        total_levels = self.MAX_LEVELS_PER_SIDE
         
-        # Size distribution (exponential decay: 70% in top 5)
-        sizes = []
-        decay_factor = 0.85  # Aggressive decay for concentration
-        for i in range(total_levels):
-            level_size = total_size * (decay_factor ** i)
-            sizes.append(level_size)
+        # Calculate uniform size to hit $10k notional per side
+        # notional = sum(price_i * size_i) ≈ avg_price * total_size
+        avg_bid_price = (bid_start + mid) / 2
+        avg_ask_price = (mid + ask_end) / 2
         
-        # Normalize to total volume
-        size_sum = sum(sizes)
-        if size_sum > 0:
-            sizes = [s / size_sum * total_size for s in sizes]
+        # Target: $10k per side
+        target_bid_notional = self.MAX_NOTIONAL_PER_SIDE
+        target_ask_notional = self.MAX_NOTIONAL_PER_SIDE
         
-        # Spread distribution (exponential expansion)
-        spreads = []
-        for i in range(total_levels):
-            t = i / (total_levels - 1) if total_levels > 1 else 0
-            spread_bps = min_spread_bps * (max_spread_bps / min_spread_bps) ** t
-            spreads.append(spread_bps)
+        # Size per level (uniform distribution)
+        size_per_bid = (target_bid_notional / avg_bid_price) / total_levels
+        size_per_ask = (target_ask_notional / avg_ask_price) / total_levels
         
-        # Apply inventory skew to spreads
-        bid_spreads = [s * bid_skew for s in spreads]
-        ask_spreads = [s * ask_skew for s in spreads]
-        
-        # Build quote levels
+        # Rounding
         tick_size = 0.01  # US500 tick
         lot_size = 0.1  # US500 lot
         
+        size_per_bid = max(round_size(size_per_bid, lot_size), lot_size)
+        size_per_ask = max(round_size(size_per_ask, lot_size), lot_size)
+        
+        # Build bids (mid to mid-2%)
         for i in range(total_levels):
-            # Bid
-            bid_spread_dollars = mid * (bid_spreads[i] / 10000)
-            bid_price = round_price(mid - bid_spread_dollars, tick_size)
-            bid_size = round_size(sizes[i], lot_size)
+            t = i / (total_levels - 1) if total_levels > 1 else 0
+            bid_price = round_price(mid - (mid - bid_start) * t, tick_size)
             
-            if bid_size >= lot_size and bid_price < orderbook.best_ask:
+            if bid_price > 0 and bid_price < mid:
                 bids.append(QuoteLevel(
                     price=bid_price,
-                    size=bid_size,
+                    size=size_per_bid,
                     side=OrderSide.BUY,
                     created_at=time.time()
                 ))
+        
+        # Build asks (mid to mid+2%)
+        for i in range(total_levels):
+            t = i / (total_levels - 1) if total_levels > 1 else 0
+            ask_price = round_price(mid + (ask_end - mid) * t, tick_size)
             
-            # Ask
-            ask_spread_dollars = mid * (ask_spreads[i] / 10000)
-            ask_price = round_price(mid + ask_spread_dollars, tick_size)
-            ask_size = round_size(sizes[i], lot_size)
-            
-            if ask_size >= lot_size and ask_price > orderbook.best_bid:
+            if ask_price > mid:
                 asks.append(QuoteLevel(
                     price=ask_price,
-                    size=ask_size,
+                    size=size_per_ask,
                     side=OrderSide.SELL,
                     created_at=time.time()
                 ))
         
-        logger.debug(f"Built {len(bids)} bids, {len(asks)} asks")
+        # Log first and last levels
+        if bids:
+            logger.debug(f"Built {len(bids)} bids: {bids[0].price:.2f} to {bids[-1].price:.2f} (size={size_per_bid:.2f})")
+        if asks:
+            logger.debug(f"Built {len(asks)} asks: {asks[0].price:.2f} to {asks[-1].price:.2f} (size={size_per_ask:.2f})")
+        
         return bids, asks
     
     # =========================================================================
@@ -878,30 +891,36 @@ class US500ProfessionalMM:
         # Calculate spread
         min_spread, max_spread = self._calculate_spread(orderbook, risk_metrics)
         
-        # Calculate size
-        base_size = self.risk_manager.calculate_order_size(
+        # Calculate size (total size across all levels)
+        per_level_size = self.risk_manager.calculate_order_size(
             orderbook.mid_price, "both", risk_metrics
         )
         
-        if base_size <= 0:
+        # Total size = per-level size * number of levels (but scale down since inner levels are smaller)
+        # With exponential decay (85%), effective levels ≈ 5-7, so use 6x multiplier
+        total_size = per_level_size * 6.0
+        
+        if total_size <= 0:
             await self._cancel_all_quotes()
             return
         
         # Build tiered quotes
         new_bids, new_asks = self._build_tiered_quotes(
-            orderbook, min_spread, max_spread, base_size
+            orderbook, min_spread, max_spread, total_size
         )
         
-        # Handle one-sided quoting (extreme imbalance >2.5%)
-        if abs(self.inventory.delta) > 0.025:
-            if self.inventory.delta > 0:  # Long - only asks
+        # Handle one-sided quoting (extreme imbalance >5% - increased from 2.5%)
+        # CRITICAL FIX: 2.5% was too aggressive, causing stuck one-sided state
+        # Market makers need to quote both sides unless truly extreme imbalance
+        if abs(self.inventory.delta) > 0.05:  # Increased threshold to 5%
+            if self.inventory.delta > 0.05:  # Long >5% - only asks
                 new_bids = []
                 await self._cancel_all_side("buy")
-                logger.info(f"ONE-SIDED asks: delta={self.inventory.delta:.3f}")
-            else:  # Short - only bids
+                logger.warning(f"ONE-SIDED asks: delta={self.inventory.delta:.3f} >5%")
+            elif self.inventory.delta < -0.05:  # Short <-5% - only bids
                 new_asks = []
                 await self._cancel_all_side("sell")
-                logger.info(f"ONE-SIDED bids: delta={self.inventory.delta:.3f}")
+                logger.warning(f"ONE-SIDED bids: delta={self.inventory.delta:.3f} <-5%")
         
         # Update orders
         await self._update_orders(new_bids, new_asks)
@@ -925,7 +944,7 @@ class US500ProfessionalMM:
         """
         now = time.time()
         
-        # Check for book moves
+        # Check for significant book moves (0.5% threshold)
         book_moved = False
         if self.last_orderbook and self.last_orderbook.mid_price:
             price_change = abs(
@@ -936,12 +955,10 @@ class US500ProfessionalMM:
                 book_moved = True
                 logger.debug(f"Book moved {price_change:.2%} - cancelling stale quotes")
         
-        # Cancel stale or mismatched bids
+        # ORDER MEMORIZATION: Only cancel if mismatched, keep orders longer
+        # Cancel ONLY mismatched bids (price not in new quote set)
         to_cancel_bids = []
         for oid, level in list(self.active_bids.items()):
-            age = now - level.created_at
-            stale = age > self.MIN_ORDER_AGE_SECONDS
-            
             # Check if matches any new bid
             matched = False
             for new_bid in new_bids:
@@ -949,22 +966,21 @@ class US500ProfessionalMM:
                     matched = True
                     break
             
-            if book_moved or stale or not matched:
+            # Only cancel if not matched (price moved out of range)
+            if not matched and book_moved:
                 to_cancel_bids.append(oid)
         
-        # Cancel stale or mismatched asks
+        # Cancel ONLY mismatched asks (price not in new quote set)
         to_cancel_asks = []
         for oid, level in list(self.active_asks.items()):
-            age = now - level.created_at
-            stale = age > self.MIN_ORDER_AGE_SECONDS
-            
             matched = False
             for new_ask in new_asks:
                 if abs(new_ask.price - level.price) < 0.01:
                     matched = True
                     break
             
-            if book_moved or stale or not matched:
+            # Only cancel if not matched (price moved out of range)
+            if not matched and book_moved:
                 to_cancel_asks.append(oid)
         
         # Cancel orders
@@ -990,7 +1006,7 @@ class US500ProfessionalMM:
                 await self._place_quote(ask)
     
     async def _place_quote(self, quote: QuoteLevel) -> None:
-        """Place a single quote (ALO for maker rebate)."""
+        """Place a single quote with order memorization."""
         try:
             order_req = OrderRequest(
                 symbol=self.symbol,
@@ -998,7 +1014,7 @@ class US500ProfessionalMM:
                 order_type=OrderType.LIMIT,
                 size=quote.size,
                 price=quote.price,
-                time_in_force=TimeInForce.ALO,  # Add liquidity only
+                time_in_force=TimeInForce.GTC,  # Good til cancelled - keep orders alive
                 reduce_only=False
             )
             
@@ -1007,16 +1023,23 @@ class US500ProfessionalMM:
                 quote.order_id = order.order_id
                 quote.created_at = time.time()
                 
+                # Add to active orders
                 if quote.side == OrderSide.BUY:
                     self.active_bids[order.order_id] = quote
                 else:
                     self.active_asks[order.order_id] = quote
                 
+                # MEMORIZE order in permanent memory
+                self._order_memory[order.order_id] = quote
+                
                 self.metrics.quotes_sent += 1
                 logger.debug(f"Placed {quote.side.value}: {quote.size} @ {quote.price}")
+            else:
+                logger.warning(f"Order placement returned no order_id: {quote.side.value} {quote.size} @ {quote.price}")
         
         except Exception as e:
-            logger.error(f"Failed to place quote: {e}")
+            logger.error(f"Failed to place quote {quote.side.value} {quote.size}@{quote.price}: {e}")
+            # Continue execution - don't crash the bot on single order failure
     
     async def _cancel_all_quotes(self) -> None:
         """Cancel all active quotes."""
@@ -1041,7 +1064,9 @@ class US500ProfessionalMM:
             return
         
         try:
-            cancelled = await self.client.batch_cancel_orders(oids)
+            # SDK expects List[Tuple[symbol, oid]]
+            cancel_requests = [(self.symbol, oid) for oid in oids]
+            cancelled = await self.client.cancel_orders_batch(cancel_requests)
             for oid in oids:
                 if oid in self.active_bids:
                     del self.active_bids[oid]
@@ -1124,9 +1149,9 @@ class US500ProfessionalMM:
             # USDH margin tracking
             self.inventory.usdh_margin_used = account_state.margin_used
             self.inventory.usdh_available = account_state.available_balance
-            if account_state.total_collateral > 0:
+            if account_state.equity > 0:
                 self.inventory.usdh_margin_ratio = (
-                    account_state.margin_used / account_state.total_collateral
+                    account_state.margin_used / account_state.equity
                 )
             
             # Update equity from trade tracker (not from account state)
@@ -1151,11 +1176,32 @@ class US500ProfessionalMM:
         except Exception as e:
             logger.error(f"Failed to sync fills: {e}")
     
+    async def _enforce_order_limits(self) -> None:
+        """Enforce max order limits to prevent accumulation."""
+        try:
+            total_active = len(self.active_bids) + len(self.active_asks)
+            
+            if total_active > self.MAX_TOTAL_ORDERS:
+                logger.warning(
+                    f"⚠️ Order limit exceeded: {total_active}/{self.MAX_TOTAL_ORDERS} - "
+                    "cancelling all orders"
+                )
+                await self._cancel_all_quotes()
+                self.active_bids.clear()
+                self.active_asks.clear()
+                
+                # Force re-sync from exchange
+                await self._sync_active_orders()
+        
+        except Exception as e:
+            logger.error(f"Order limit enforcement failed: {e}")
+    
     async def _sync_active_orders(self) -> None:
         """Sync active orders with exchange (US500 uses historicalOrders)."""
         try:
-            # US500 uses historicalOrders API (openOrders doesn't work for HIP-3)
-            orders = await self.client.get_open_orders(self.symbol)
+            # US500 uses Info API to fetch open orders
+            wallet_address = self.client.config.wallet_address
+            orders = self.client._info.open_orders(wallet_address)
             
             # Remove local orders not on exchange
             exchange_oids = {o.order_id for o in orders if o.order_id}

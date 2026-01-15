@@ -183,7 +183,8 @@ class Config:
         """
         # Determine .env path
         if env_path is None:
-            project_root = Path(__file__).parent.parent
+            # From src/utils/config.py -> src/utils -> src -> AMM-500
+            project_root = Path(__file__).parent.parent.parent
             env_path = project_root / "config" / ".env"
 
         # Load .env file if it exists

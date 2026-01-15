@@ -8,7 +8,7 @@ import asyncio
 from unittest.mock import Mock, AsyncMock, patch
 import numpy as np
 
-from src.strategy_us500_pro import US500ProfessionalMM, BookDepthAnalysis, InventoryState
+from src.core.strategy_us500_pro import US500ProfessionalMM, BookDepthAnalysis, InventoryState
 from src.utils.config import Config
 from src.core.exchange import HyperliquidClient, OrderBook, OrderSide
 from src.core.risk import RiskManager, RiskMetrics, RiskLevel

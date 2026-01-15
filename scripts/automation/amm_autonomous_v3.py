@@ -30,7 +30,7 @@ from typing import Any, Optional
 import httpx
 
 # Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent  # scripts/automation -> scripts -> AMM-500
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Load environment variables
@@ -81,7 +81,20 @@ USER_WALLET = os.getenv("WALLET_ADDRESS", os.getenv("HL_WALLET", ""))
 # =============================================================================
 
 class AsyncLogger:
-    """Async-capable logger with file and console output."""
+    """Async-capable logger with file and console output, optimized for dark themes."""
+    
+    # ANSI color codes optimized for dark terminal backgrounds
+    COLORS = {
+        'ERROR': '\033[91m',    # Bright red
+        'WARN': '\033[93m',     # Bright yellow
+        'INFO': '\033[96m',     # Bright cyan
+        'DEBUG': '\033[2;37m',  # Dim white
+        'DATA': '\033[92m',     # Bright green
+        'ALERT': '\033[95m',    # Bright magenta
+        'RESET': '\033[0m',     # Reset to default
+        'BOLD': '\033[1m',      # Bold text
+        'DIM': '\033[2m'        # Dim text
+    }
     
     def __init__(self, log_file: Path):
         self.log_file = log_file
@@ -94,12 +107,24 @@ class AsyncLogger:
     
     def _format_message(self, level: str, message: str) -> str:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # File version (no colors)
         return f"[{timestamp}] [{level:5}] {message}"
+    
+    def _format_console_message(self, level: str, message: str) -> str:
+        """Format with colors for console output."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        color = self.COLORS.get(level.upper(), self.COLORS['RESET'])
+        reset = self.COLORS['RESET']
+        dim = self.COLORS['DIM']
+        
+        # Colorize level and apply dim to timestamp
+        return f"{dim}[{timestamp}]{reset} [{color}{level:5}{reset}] {message}"
     
     def log(self, level: str, message: str):
         """Synchronous log (for backward compatibility)."""
         formatted = self._format_message(level, message)
-        print(formatted, flush=True)
+        console_formatted = self._format_console_message(level, message)
+        print(console_formatted, flush=True)
         self.log_queue.append(formatted)
         # Write to file in background
         self._executor.submit(self._write_to_file, formatted)
@@ -114,7 +139,8 @@ class AsyncLogger:
     async def async_log(self, level: str, message: str):
         """Async log using aiofiles pattern."""
         formatted = self._format_message(level, message)
-        print(formatted, flush=True)
+        console_formatted = self._format_console_message(level, message)
+        print(console_formatted, flush=True)
         self.log_queue.append(formatted)
         # Use thread executor for file I/O
         loop = asyncio.get_event_loop()
@@ -190,8 +216,8 @@ class WalletTracker:
         self.private_key = private_key
         self.info = Info(hl_constants.MAINNET_API_URL, skip_ws=True)
         self.state_history: deque = deque(maxlen=100)
-        self.peak_equity = 0.0
         self.session_start_equity = 1000.0  # Hardcoded starting capital
+        self.peak_equity = self.session_start_equity  # Initialize peak to session start
         self.realized_pnl = 0.0  # Track cumulative realized PnL from fills
         self._initialized = False
     

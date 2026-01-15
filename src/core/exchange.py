@@ -528,30 +528,36 @@ class HyperliquidClient:
         if not self._ws:
             return
 
+        # HIP-3 markets need km: prefix for WebSocket subscriptions
+        ws_symbol = f"km:{symbol}" if symbol.upper() == "US500" else symbol
+
         msg = {
             "method": "subscribe",
             "subscription": {
                 "type": "l2Book",
-                "coin": symbol,
+                "coin": ws_symbol,
             },
         }
         await self._ws.send(json.dumps(msg))
-        logger.debug(f"Subscribed to {symbol} order book")
+        logger.debug(f"Subscribed to {ws_symbol} order book")
 
     async def _subscribe_trades(self, symbol: str) -> None:
         """Subscribe to trade updates."""
         if not self._ws:
             return
 
+        # HIP-3 markets need km: prefix for WebSocket subscriptions
+        ws_symbol = f"km:{symbol}" if symbol.upper() == "US500" else symbol
+
         msg = {
             "method": "subscribe",
             "subscription": {
                 "type": "trades",
-                "coin": symbol,
+                "coin": ws_symbol,
             },
         }
         await self._ws.send(json.dumps(msg))
-        logger.debug(f"Subscribed to {symbol} trades")
+        logger.debug(f"Subscribed to {ws_symbol} trades")
 
     async def _subscribe_user_events(self) -> None:
         """Subscribe to user-specific events (fills, orders)."""
@@ -598,14 +604,10 @@ class HyperliquidClient:
     async def _reconnect_websocket(self) -> None:
         """Attempt to reconnect WebSocket with exponential backoff.
 
-        SURVIVAL MODE: Disabled reconnection to avoid rate limit issues.
-        The bot will run in REST-only mode.
+        IMPROVED: Auto-reconnect after failures with backoff, but with rate limit protection.
+        Falls back to REST-only if reconnection fails repeatedly.
         """
-        # SURVIVAL MODE: Don't attempt reconnection - just log and continue
-        # WebSocket is blocked with "100 connections" error
-        logger.warning("WebSocket reconnection DISABLED (SURVIVAL MODE) - running REST-only")
-
-        # Clean up old connections
+        # Clean up old connections first
         if self._ws:
             try:
                 await self._ws.close()
@@ -621,7 +623,26 @@ class HyperliquidClient:
                 pass
             self._ws_task = None
 
-        # Don't attempt to reconnect - just return
+        # Track reconnection attempts to avoid infinite loops
+        max_attempts = 3
+        backoff_seconds = 5
+        
+        for attempt in range(max_attempts):
+            try:
+                logger.info(f"Attempting WebSocket reconnect ({attempt+1}/{max_attempts})...")
+                await asyncio.sleep(backoff_seconds * (attempt + 1))  # Exponential backoff
+                
+                # Try to reconnect
+                await self._connect_websocket()
+                logger.info("✅ WebSocket reconnected successfully")
+                return
+                
+            except Exception as e:
+                logger.warning(f"Reconnection attempt {attempt+1} failed: {e}")
+                
+        # If all attempts failed, continue in REST-only mode
+        logger.warning("⚠️ WebSocket reconnection FAILED after 3 attempts - running REST-only")
+        self._connected = True  # Keep bot running with REST fallback
 
     async def _process_ws_message(self, data: Dict) -> None:
         """Process a WebSocket message."""
@@ -637,6 +658,11 @@ class HyperliquidClient:
     async def _handle_orderbook_update(self, data: Dict) -> None:
         """Handle order book update."""
         coin = data.get("coin", self.config.trading.symbol)
+        
+        # Normalize km: prefix for internal storage (store as "US500" not "km:US500")
+        if coin.startswith("km:"):
+            coin = coin.split(":", 1)[1]
+        
         levels = data.get("levels", [[], []])
 
         # Parse bids and asks
@@ -739,6 +765,11 @@ class HyperliquidClient:
         if not self._exchange:
             raise RuntimeError("Not connected to exchange")
 
+        # CRITICAL FIX: Handle paper trading mode for single orders
+        if self.config.execution.paper_trading:
+            batch_result = await self._simulate_orders_batch([request])
+            return batch_result[0] if batch_result else None
+
         await self._rate_limiter.acquire(weight=1)
         self._order_latency.start()
 
@@ -768,11 +799,11 @@ class HyperliquidClient:
             is_buy = request.side == OrderSide.BUY
 
             order_result = self._exchange.order(
-                coin=api_symbol,
-                is_buy=is_buy,
-                sz=size,
-                limit_px=price,
-                order_type={"limit": {"tif": request.time_in_force.value}},
+                api_symbol,
+                is_buy,
+                size,
+                price,
+                {"limit": {"tif": request.time_in_force.value}},
                 reduce_only=request.reduce_only,
             )
 
@@ -2024,8 +2055,11 @@ class HyperliquidClient:
             is_buy = side == OrderSide.BUY
 
             # IOC order - executes immediately or cancels
+            # CRITICAL FIX: Handle km:US500 symbol properly
+            order_symbol = symbol if not symbol.startswith('km:') else symbol.split(':')[1]
+            
             order_result = self._exchange.order(
-                name=symbol,
+                name=order_symbol,  # Use base symbol without km: prefix
                 is_buy=is_buy,
                 sz=size,
                 limit_px=price,
@@ -2040,14 +2074,16 @@ class HyperliquidClient:
 
                 if statuses:
                     status = statuses[0]
-                    if status.get("filled"):
-                        filled = status["filled"]
+                    filled_data = status.get("filled")
+                    if filled_data and isinstance(filled_data, dict):
                         logger.info(
-                            f"IOC rebalance filled: {side.value} {filled.get('totalSz')} @ {filled.get('avgPx')}"
+                            f"IOC rebalance filled: {side.value} {filled_data.get('totalSz')} @ {filled_data.get('avgPx')}"
                         )
-                        return str(filled.get("oid", ""))
+                        return str(filled_data.get("oid", ""))
                     else:
-                        logger.debug("IOC order not filled (price didn't cross)")
+                        logger.debug(f"IOC order not filled (status: {status})")
+            else:
+                logger.warning(f"IOC order result: {order_result}")
 
             return None
 

@@ -54,6 +54,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from loguru import logger
 
 from src.utils.config import Config
+from src.utils.logging_config import setup_dark_logging
 from src.core.exchange import HyperliquidClient
 from src.core.risk import RiskManager
 from src.core.strategy_us500_pro import US500ProfessionalMM, StrategyState
@@ -68,41 +69,15 @@ from src.utils.data_fetcher import US500DataManager
 
 
 def setup_logging(config: Config) -> None:
-    """Configure logging."""
+    """Configure logging with dark-theme optimized format."""
     log_dir = Path(__file__).parent / "logs"
-    log_dir.mkdir(exist_ok=True)
-
-    # Remove default handler
-    logger.remove()
-
-    # Console handler
-    logger.add(
-        sys.stderr,
-        level=config.logging.log_level,
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
-        colorize=True,
+    
+    setup_dark_logging(
+        log_dir=log_dir,
+        log_level=config.logging.log_level,
+        log_retention_days=config.logging.log_retention_days,
+        enable_trade_log=config.logging.log_trades,
     )
-
-    # File handler - main log
-    logger.add(
-        log_dir / "bot_{time:YYYY-MM-DD}.log",
-        level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        rotation="00:00",
-        retention=f"{config.logging.log_retention_days} days",
-        compression="gz",
-    )
-
-    # Trade log (if enabled)
-    if config.logging.log_trades:
-        logger.add(
-            log_dir / "trades_{time:YYYY-MM-DD}.log",
-            level="INFO",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
-            filter=lambda record: "trade" in record["extra"],
-            rotation="00:00",
-            retention=f"{config.logging.log_retention_days} days",
-        )
 
 
 # =============================================================================

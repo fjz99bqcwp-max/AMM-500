@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.utils.config import Config, TradingConfig, RiskConfig, ExecutionConfig
 from src.core.strategy_us500_pro import (
-    MarketMakingStrategy,
+    US500ProfessionalMM,
     StrategyState,
     StrategyMetrics,
     InventoryState,
     QuoteLevel,
+    BookDepthAnalysis,
 )
 from src.core.exchange import OrderBook, Position, OrderSide
 from src.core.risk import RiskManager, RiskMetrics, RiskLevel

@@ -434,7 +434,9 @@ class RiskManager:
                 prices, span=20, samples_per_minute=samples_per_minute
             )
         else:
-            metrics.current_volatility = 0.0
+            # Warmup period: use conservative fallback estimate
+            # US500 typically 10-15% annualized volatility = 5-7% for shorter periods
+            metrics.current_volatility = 5.0
 
         if self.high_vol_threshold > 0:
             metrics.volatility_ratio = metrics.current_volatility / self.high_vol_threshold
@@ -531,6 +533,9 @@ class RiskManager:
     def _assess_risk_level(self, metrics: RiskMetrics, position: Optional[Position]) -> RiskMetrics:
         """Assess overall risk level and set recommendations."""
         risk_scores = []
+        
+        # Check if we have an active position
+        has_position = position is not None and abs(position.size) > 0.0001
 
         # Score based on margin ratio (higher = more risk)
         if metrics.margin_ratio > 0.8:
@@ -543,10 +548,12 @@ class RiskManager:
             risk_scores.append(1)  # Low
 
         # Score based on drawdown
+        # CRITICAL FIX: Only treat drawdown as critical risk if we have an active position
+        # Historical drawdown without position shouldn't prevent market making
         if metrics.current_drawdown > self.max_drawdown:
-            risk_scores.append(4)
+            risk_scores.append(4 if has_position else 2)  # Critical if holding, Medium if flat
         elif metrics.current_drawdown > self.max_drawdown * 0.7:
-            risk_scores.append(3)
+            risk_scores.append(3 if has_position else 2)  # High if holding, Medium if flat
         elif metrics.current_drawdown > self.max_drawdown * 0.5:
             risk_scores.append(2)
         else:
@@ -703,8 +710,14 @@ class RiskManager:
 
         # Apply risk level multipliers
         if metrics:
+            # CRITICAL FIX: Allow orders even at CRITICAL risk if we have no exposure
+            # This prevents historical drawdown from blocking new market making activity
             if metrics.risk_level == RiskLevel.CRITICAL:
-                return 0.0  # No new orders
+                if metrics.exposure_pct > 0.01:  # Have active position
+                    return 0.0  # No new orders when position at risk
+                else:
+                    # No position - allow conservative market making
+                    kelly_size *= 0.1  # Very conservative 10% of normal size
             elif metrics.risk_level == RiskLevel.HIGH:
                 kelly_size *= 0.25
             elif metrics.risk_level == RiskLevel.MEDIUM:
