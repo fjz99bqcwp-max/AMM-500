@@ -206,7 +206,7 @@ async def fetch_us500_data_with_fallback(days: int = 30) -> Optional[pd.DataFram
             # Run backtest on df
             ...
     """
-    from .data_fetcher import HyperliquidDataFetcher
+    from src.utils.data_fetcher import HyperliquidDataFetcher
     
     config = Config.load()
     primary_fetcher = HyperliquidDataFetcher(config)
@@ -236,8 +236,8 @@ async def fetch_candles_with_xyz100_fallback(
 ) -> Optional[List[CandleData]]:
     # Fetch candles with automatic ^OEX fallback
     
-    from .xyz100_fallback import XYZ100FallbackFetcher
-    from .data_fetcher import CandleData
+    from src.utils.xyz100_fallback import XYZ100FallbackFetcher
+    from src.utils.data_fetcher import CandleData
     
     # Try primary
     candles = await self.fetch_candles(

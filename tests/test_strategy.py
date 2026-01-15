@@ -6,17 +6,17 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from src.config import Config, TradingConfig, RiskConfig, ExecutionConfig
-from src.strategy import (
+from src.utils.config import Config, TradingConfig, RiskConfig, ExecutionConfig
+from src.core.strategy_us500_pro import (
     MarketMakingStrategy,
     StrategyState,
     StrategyMetrics,
     InventoryState,
     QuoteLevel,
 )
-from src.exchange import OrderBook, Position, OrderSide
-from src.risk import RiskManager, RiskMetrics, RiskLevel
-from src.utils import CircularBuffer
+from src.core.exchange import OrderBook, Position, OrderSide
+from src.core.risk import RiskManager, RiskMetrics, RiskLevel
+from src.utils.utils import CircularBuffer
 
 
 class MockHyperliquidClient:

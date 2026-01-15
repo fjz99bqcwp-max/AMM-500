@@ -36,8 +36,8 @@ try:
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
-from .config import Config
-from .utils import (
+from src.utils.config import Config
+from src.utils.utils import (
     calculate_max_drawdown,
     calculate_sharpe_ratio,
     round_price,
@@ -1422,7 +1422,7 @@ def run_backtest(
 
 async def _fetch_real_data(days: int) -> pd.DataFrame:
     """Fetch real historical data from Hyperliquid API."""
-    from .data_fetcher import HyperliquidDataFetcher, load_cached_data
+    from src.utils.data_fetcher import HyperliquidDataFetcher, load_cached_data
 
     # Check for cached data first
     cached_candles, cached_funding = load_cached_data("BTC", days, "1m")

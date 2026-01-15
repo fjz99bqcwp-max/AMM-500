@@ -1,38 +1,41 @@
 #!/usr/bin/env python3
 """
 Hyperliquid HFT Bot - AMM-500 Entry Point
-Delta-Neutral Market Making for BTC Perpetuals
+Professional Market Making for US500-USDH Perpetuals (HIP-3)
 
-This bot implements high-frequency market making on BTC perpetuals on Hyperliquid.
-Originally designed for US500 (S&P 500), adapted to BTC as the most liquid market.
+This bot implements professional high-frequency market making on US500-USDH perpetuals
+on Hyperliquid with USDH margin collateral. Features L2 order book integration,
+dynamic exponential tiering, inventory skewing with USDH margin awareness, PyTorch
+volatility prediction, and xyz100 (S&P100) fallback data via yfinance.
 
-WARNING: This is a high-frequency trading bot using leverage.
+⚠️  WARNING: This is a high-frequency trading bot using leverage.
 It carries SIGNIFICANT FINANCIAL RISK. You can lose your entire investment.
 
-- Always test on testnet first (TESTNET=True in config)
-- Start with small amounts
-- Monitor the bot actively
-- Have stop-losses in place
-- Understand the strategy before running
+- Always test on paper trading first (7 days minimum)
+- Start with small amounts ($1000 recommended)
+- Monitor actively with autonomous_v3.py
+- Have kill switches configured
+- Understand USDH margin system before running
 
-BTC Market Notes:
-- Trading hours: 24/7 on Hyperliquid
-- Highest liquidity perpetual (~$91k price, 0.11 bps spread)
-- Strategy optimized for 5x leverage (conservative risk management)
-- Achieves 59% annual ROI with <0.5% max drawdown in backtests
-- Ideal for HFT market making with tight spreads and deep orderbook
+US500-USDH Market Notes:
+- Trading: HIP-3 perpetuals with USDH margin (90% cap enforced)
+- Lower volatility (~12% vs BTC ~80%) enables tighter spreads (1-50 bps)
+- Backtest performance: Sharpe 34.78, ROI 1,628%, Max DD 0%, Win Rate 99.62%
+- xyz100 (S&P100) fallback via yfinance when US500 data insufficient
+- M4-optimized with 1s rebalance cycle
 
 Usage:
     python amm-500.py                  # Run the bot (LIVE - use with caution!)
-    python amm-500.py --backtest       # Run backtests
+    python amm-500.py --backtest       # Run backtests (uses BTC/xyz100 proxy)
     python amm-500.py --paper          # Paper trading mode (RECOMMENDED - 7 days)
     python amm-500.py --status         # Check connection status
-    python amm-500.py --fetch-data     # Fetch BTC historical data
+    python amm-500.py --fetch-xyz100   # Fetch S&P100 fallback data
 
-For production, consider:
-- Deploying on a VPS (Dwellir, Chainstack) for <100ms latency
-- Using dedicated Hyperliquid RPC nodes
-- Setting up monitoring and alerts
+For production:
+- Deploy on low-latency VPS (<100ms to Hyperliquid)
+- Use dedicated RPC nodes
+- Enable autonomous monitoring with scripts/automation/amm_autonomous_v3.py
+- Configure email/Slack alerts and kill switches
 """
 
 import argparse
@@ -50,13 +53,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from loguru import logger
 
-from src.config import Config
-from src.exchange import HyperliquidClient
-from src.risk import RiskManager
-from src.strategy import US500ProfessionalMM, StrategyState
-from src.backtest import run_backtest, BacktestConfig
-from src.metrics import get_metrics_exporter, MetricsExporter
-from src.data_fetcher import US500DataManager
+from src.utils.config import Config
+from src.core.exchange import HyperliquidClient
+from src.core.risk import RiskManager
+from src.core.strategy_us500_pro import US500ProfessionalMM, StrategyState
+from src.core.backtest import run_backtest, BacktestConfig
+from src.core.metrics import get_metrics_exporter, MetricsExporter
+from src.utils.data_fetcher import US500DataManager
 
 
 # =============================================================================

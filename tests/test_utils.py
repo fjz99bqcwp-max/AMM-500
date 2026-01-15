@@ -4,7 +4,7 @@ Tests for utility functions.
 
 import numpy as np
 import pytest
-from src.utils import (
+from src.utils.utils import (
     round_price,
     round_size,
     calculate_mid_price,

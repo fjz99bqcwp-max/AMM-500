@@ -27,8 +27,8 @@ import websockets
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from .config import Config
-from .utils import (
+from src.utils.config import Config
+from src.utils.utils import (
     LatencyTracker,
     RateLimiter,
     get_timestamp_ms,

@@ -14,9 +14,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from loguru import logger
 
-from .config import Config
-from .exchange import AccountState, HyperliquidClient, Order, OrderBook, Position
-from .utils import (
+from src.utils.config import Config
+from src.core.exchange import AccountState, HyperliquidClient, Order, OrderBook, Position
+from src.utils.utils import (
     CircularBuffer,
     calculate_ewma_volatility,
     calculate_kelly_fraction,
@@ -941,7 +941,7 @@ class RiskManager:
 
             if position and position.size != 0:
                 # Close with market order
-                from .exchange import OrderRequest, OrderSide, OrderType, TimeInForce
+                from src.core.exchange import OrderRequest, OrderSide, OrderType, TimeInForce
 
                 close_side = OrderSide.SELL if position.is_long else OrderSide.BUY
 

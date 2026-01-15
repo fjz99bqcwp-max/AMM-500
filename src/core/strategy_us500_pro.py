@@ -28,8 +28,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from loguru import logger
 
-from .config import Config
-from .exchange import (
+from src.utils.config import Config
+from src.core.exchange import (
     HyperliquidClient,
     Order,
     OrderBook,
@@ -39,8 +39,8 @@ from .exchange import (
     Position,
     TimeInForce,
 )
-from .risk import RiskManager, RiskMetrics, RiskLevel
-from .utils import (
+from src.core.risk import RiskManager, RiskMetrics, RiskLevel
+from src.utils.utils import (
     calculate_imbalance,
     calculate_microprice,
     calculate_realized_volatility,

@@ -5,14 +5,14 @@ Tests for risk management module.
 import pytest
 import numpy as np
 
-from src.config import Config, TradingConfig, RiskConfig
-from src.risk import (
+from src.utils.config import Config, TradingConfig, RiskConfig
+from src.core.risk import (
     RiskManager,
     RiskMetrics,
     RiskState,
     RiskLevel,
 )
-from src.exchange import Position, AccountState
+from src.core.exchange import Position, AccountState
 
 
 class MockHyperliquidClient:

@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 from datetime import datetime, timedelta
 
-from src.backtest import (
+from src.core.backtest import (
     BacktestConfig,
     BacktestEngine,
     BacktestResult,
