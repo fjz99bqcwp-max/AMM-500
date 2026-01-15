@@ -53,7 +53,7 @@ from loguru import logger
 from src.config import Config
 from src.exchange import HyperliquidClient
 from src.risk import RiskManager
-from src.strategy import MarketMakingStrategy, StrategyState
+from src.strategy import US500ProfessionalMM, StrategyState
 from src.backtest import run_backtest, BacktestConfig
 from src.metrics import get_metrics_exporter, MetricsExporter
 from src.data_fetcher import US500DataManager
@@ -118,7 +118,7 @@ class HFTBot:
         self.config = config
         self.client: Optional[HyperliquidClient] = None
         self.risk_manager: Optional[RiskManager] = None
-        self.strategy: Optional[MarketMakingStrategy] = None
+        self.strategy: Optional[US500ProfessionalMM] = None
         self.running = False
         self._shutdown_event = asyncio.Event()
         self.metrics_exporter = get_metrics_exporter(port=metrics_port)
@@ -171,7 +171,7 @@ class HFTBot:
             self.risk_manager = RiskManager(self.config, self.client)
 
             logger.info("Initializing strategy...")
-            self.strategy = MarketMakingStrategy(self.config, self.client, self.risk_manager)
+            self.strategy = US500ProfessionalMM(self.config, self.client, self.risk_manager)
             await self.strategy.start()
 
             self.running = True
