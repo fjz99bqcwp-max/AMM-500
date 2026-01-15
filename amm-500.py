@@ -57,7 +57,7 @@ from src.utils.config import Config
 from src.utils.logging_config import setup_dark_logging
 from src.core.exchange import HyperliquidClient
 from src.core.risk import RiskManager
-from src.core.strategy_us500_pro import US500ProfessionalMM, StrategyState
+from src.core.strategy import US500ProfessionalMM, StrategyState
 from src.core.backtest import run_backtest, BacktestConfig
 from src.core.metrics import get_metrics_exporter, MetricsExporter
 from src.utils.data_fetcher import US500DataManager

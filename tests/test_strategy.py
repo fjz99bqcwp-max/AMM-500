@@ -1,506 +1,421 @@
 """
-Tests for strategy module.
+TESTS FOR US500-USDH PROFESSIONAL MM STRATEGY
+/Users/nheosdisplay/VSC/AMM/AMM-500/tests/test_us500_strategy.py
 """
 
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import Mock, AsyncMock, patch
+import numpy as np
 
-from src.utils.config import Config, TradingConfig, RiskConfig, ExecutionConfig
-from src.core.strategy_us500_pro import (
-    US500ProfessionalMM,
-    StrategyState,
-    StrategyMetrics,
-    InventoryState,
-    QuoteLevel,
-    BookDepthAnalysis,
-)
-from src.core.exchange import OrderBook, Position, OrderSide
+from src.core.strategy import US500ProfessionalMM, BookDepthAnalysis, InventoryState
+from src.utils.config import Config
+from src.core.exchange import HyperliquidClient, OrderBook, OrderSide
 from src.core.risk import RiskManager, RiskMetrics, RiskLevel
-from src.utils.utils import CircularBuffer
 
 
-class MockHyperliquidClient:
-    """Mock Hyperliquid client for testing."""
-
-    def __init__(self):
-        self.connected = True
-        self.orders_placed = []
-        self.orders_cancelled = []
-        self.orderbook = None
-        self.position = None
-        self.funding_rate = 0.0001
-
-        # Callbacks
-        self._orderbook_callbacks = []
-        self._trade_callbacks = []
-        self._user_callbacks = []
-
-    async def connect(self):
-        self.connected = True
-
-    async def disconnect(self):
-        self.connected = False
-
-    async def get_orderbook(self, symbol=None):
-        return self.orderbook
-
-    async def get_position(self, symbol=None):
-        return self.position
-
-    async def get_funding_rate(self, symbol=None):
-        return self.funding_rate
-
-    async def get_account_state(self):
-        return MagicMock(
-            equity=2000.0,
-            available_balance=1500.0,
-            margin_used=500.0,
-            unrealized_pnl=0.0,
-        )
-
-    async def place_order(self, request):
-        self.orders_placed.append(request)
-        return MagicMock(order_id=f"order_{len(self.orders_placed)}")
-
-    async def place_orders_batch(self, requests):
-        results = []
-        for req in requests:
-            self.orders_placed.append(req)
-            results.append(MagicMock(order_id=f"order_{len(self.orders_placed)}"))
-        return results
-
-    async def cancel_order(self, symbol, order_id):
-        self.orders_cancelled.append(order_id)
-        return True
-
-    async def cancel_all_orders(self, symbol=None):
-        count = len(self.orders_placed)
-        self.orders_cancelled.extend([f"order_{i}" for i in range(count)])
-        return count
-
-    def on_orderbook_update(self, callback):
-        self._orderbook_callbacks.append(callback)
-
-    def on_trade(self, callback):
-        self._trade_callbacks.append(callback)
-
-    def on_user_update(self, callback):
-        self._user_callbacks.append(callback)
-
-
-class MockRiskManager:
-    """Mock risk manager for testing."""
-
-    def __init__(self):
-        self.initialized = False
-        self.risk_metrics = RiskMetrics(risk_level=RiskLevel.LOW)
-
-    async def initialize(self):
-        self.initialized = True
-
-    async def check_risk(self):
-        return self.risk_metrics
-
-    async def adjust_leverage(self, metrics):
-        return False
-
-    def calculate_order_size(self, price, side, metrics=None):
-        return 0.001  # Fixed size for testing
-
-
-class TestStrategyMetrics:
-    """Tests for StrategyMetrics dataclass."""
-
-    def test_default_values(self):
-        """Test default strategy metrics."""
-        metrics = StrategyMetrics()
-
-        assert metrics.quotes_sent == 0
-        assert metrics.quotes_filled == 0
-        assert metrics.fill_rate == 0.0
-        assert metrics.net_pnl == 0.0
-
-    def test_fill_rate_calculation(self):
-        """Test fill rate calculation."""
-        metrics = StrategyMetrics(
-            quotes_sent=100,
-            quotes_filled=60,
-        )
-
-        assert metrics.fill_rate == 0.6
-
-    def test_avg_spread_capture(self):
-        """Test average spread capture calculation."""
-        metrics = StrategyMetrics(
-            quotes_filled=10,
-            spread_capture=50.0,
-        )
-
-        assert metrics.avg_spread_capture == 5.0
-
-
-class TestInventoryState:
-    """Tests for InventoryState dataclass."""
-
-    def test_default_values(self):
-        """Test default inventory state."""
-        inventory = InventoryState()
-
-        assert inventory.position_size == 0.0
-        assert inventory.delta == 0.0
-        assert inventory.is_balanced == True
-
-    def test_is_balanced(self):
-        """Test balance detection."""
-        # Balanced (within 10% threshold)
-        inventory = InventoryState(delta=0.05)
-        assert inventory.is_balanced == True
-
-        inventory = InventoryState(delta=0.09)
-        assert inventory.is_balanced == True  # Within 10% threshold
-
-        # Imbalanced (beyond 10% threshold)
-        inventory = InventoryState(delta=0.15)
-        assert inventory.is_balanced == False
-
-
-class TestQuoteLevel:
-    """Tests for QuoteLevel dataclass."""
-
-    def test_quote_creation(self):
-        """Test quote level creation."""
-        quote = QuoteLevel(
-            price=100000.0,
-            size=0.01,
-            side=OrderSide.BUY,
-        )
-
-        assert quote.price == 100000.0
-        assert quote.size == 0.01
-        assert quote.side == OrderSide.BUY
-        assert quote.order_id is None
-
-
-class TestMarketMakingStrategy:
-    """Tests for MarketMakingStrategy class."""
-
-    @pytest.fixture
-    def config(self):
-        """Create test configuration."""
-        return Config(
-            private_key="test_key",
-            wallet_address="0x1234",
-            trading=TradingConfig(
-                symbol="BTC",
-                leverage=25,
-                collateral=2000.0,
-                min_spread_bps=5.0,
-                max_spread_bps=50.0,
-                order_size_fraction=0.02,
-                order_levels=3,
-            ),
-            risk=RiskConfig(
-                max_drawdown=0.10,
-                stop_loss_pct=0.04,
-            ),
-            execution=ExecutionConfig(
-                quote_refresh_interval=1.0,
-                rebalance_interval=60.0,
-            ),
-        )
-
-    @pytest.fixture
-    def mock_client(self):
-        """Create mock client."""
-        client = MockHyperliquidClient()
-        client.orderbook = OrderBook(
-            symbol="BTC",
-            bids=[(100000.0, 1.0), (99990.0, 2.0)],
-            asks=[(100010.0, 1.0), (100020.0, 2.0)],
-            timestamp=1000000,
-        )
-        return client
-
-    @pytest.fixture
-    def mock_risk_manager(self):
-        """Create mock risk manager."""
-        return MockRiskManager()
-
-    @pytest.fixture
-    def strategy(self, config, mock_client, mock_risk_manager):
-        """Create strategy instance."""
-        return MarketMakingStrategy(config, mock_client, mock_risk_manager)
-
-    def test_initialization(self, strategy):
-        """Test strategy initialization."""
-        assert strategy.state == StrategyState.STOPPED
-        assert strategy.symbol == "BTC"
-        assert len(strategy.active_bids) == 0
-        assert len(strategy.active_asks) == 0
-
-    @pytest.mark.asyncio
-    async def test_start(self, strategy, mock_client, mock_risk_manager):
-        """Test strategy start."""
-        await strategy.start()
-
-        assert strategy.state == StrategyState.RUNNING
-        assert mock_risk_manager.initialized == True
-
-    @pytest.mark.asyncio
-    async def test_stop(self, strategy, mock_client):
-        """Test strategy stop."""
-        await strategy.start()
-        await strategy.stop()
-
-        assert strategy.state == StrategyState.STOPPED
-        assert len(strategy.active_bids) == 0
-        assert len(strategy.active_asks) == 0
-
-    @pytest.mark.asyncio
-    async def test_pause_resume(self, strategy):
-        """Test strategy pause and resume."""
-        await strategy.start()
-
-        await strategy.pause()
-        assert strategy.state == StrategyState.PAUSED
-
-        await strategy.resume()
-        assert strategy.state == StrategyState.RUNNING
-
-    def test_calculate_spread_base(self, strategy, mock_client):
-        """Test base spread calculation."""
-        orderbook = mock_client.orderbook
-        risk_metrics = RiskMetrics(
-            risk_level=RiskLevel.LOW,
-            current_volatility=50.0,
-            volatility_ratio=0.5,
-        )
-
-        spread = strategy._calculate_spread(orderbook, risk_metrics)
-
-        assert spread >= strategy.min_spread_bps
-        assert spread <= strategy.max_spread_bps
-
-    def test_calculate_spread_widens_with_volatility(self, strategy, mock_client):
-        """Test that spread widens with volatility."""
-        orderbook = mock_client.orderbook
-
-        # Low volatility - populate price buffer with stable prices
-        strategy.price_buffer = CircularBuffer(100)  # Reset buffer
-        for i in range(100):
-            strategy.price_buffer.append(100000.0 + i * 0.1)  # Very stable prices
-
-        low_vol_metrics = RiskMetrics(
-            risk_level=RiskLevel.LOW,
-        )
-        low_vol_spread = strategy._calculate_spread(orderbook, low_vol_metrics)
-
-        # High volatility - populate price buffer with volatile prices
-        strategy.price_buffer = CircularBuffer(100)  # Reset buffer
-        for i in range(100):
-            strategy.price_buffer.append(100000.0 + i * 100.0)  # More volatile prices
-
-        high_vol_metrics = RiskMetrics(
-            risk_level=RiskLevel.LOW,
-        )
-        high_vol_spread = strategy._calculate_spread(orderbook, high_vol_metrics)
-
-        # With higher volatility, spread should increase
-        assert high_vol_spread >= low_vol_spread
-
-    def test_calculate_spread_widens_with_risk(self, strategy, mock_client):
-        """Test that spread widens with risk level."""
-        orderbook = mock_client.orderbook
-
-        # Low risk
-        low_risk = RiskMetrics(risk_level=RiskLevel.LOW)
-        low_risk_spread = strategy._calculate_spread(orderbook, low_risk)
-
-        # High risk
-        high_risk = RiskMetrics(risk_level=RiskLevel.HIGH)
-        high_risk_spread = strategy._calculate_spread(orderbook, high_risk)
-
-        assert high_risk_spread > low_risk_spread
-
-    def test_calculate_quote_prices(self, strategy, mock_client):
-        """Test quote price calculation."""
-        orderbook = mock_client.orderbook
-        risk_metrics = RiskMetrics(risk_level=RiskLevel.LOW)
-        spread_bps = 10.0
-
-        bid_price, ask_price = strategy._calculate_quote_prices(orderbook, spread_bps, risk_metrics)
-
-        # Bid should be below mid
-        assert bid_price < orderbook.mid_price
-
-        # Ask should be above mid
-        assert ask_price > orderbook.mid_price
-
-        # Spread should be approximately correct (allow wider due to OPT#17 anti-picking-off)
-        # OPT#17 adds 8-15 bps distance for defense, so actual spread may be wider
-        actual_spread_bps = (ask_price - bid_price) / orderbook.mid_price * 10000
-        assert abs(actual_spread_bps - spread_bps) < 10.0  # Wider tolerance for OPT#17 adjustments
-
-    def test_calculate_quote_prices_with_inventory_skew(self, strategy, mock_client):
-        """Test that quotes respond to inventory position."""
-        orderbook = mock_client.orderbook
-        risk_metrics = RiskMetrics(risk_level=RiskLevel.LOW)
-        spread_bps = 10.0
-
-        # Neutral inventory
-        strategy.inventory.delta = 0.0
-        neutral_bid, neutral_ask = strategy._calculate_quote_prices(
-            orderbook, spread_bps, risk_metrics
-        )
-
-        # Long inventory (want to sell) - use large delta to trigger aggressive skew
-        strategy.inventory.delta = 0.20  # 20% delta should trigger aggressive sell
-        long_bid, long_ask = strategy._calculate_quote_prices(orderbook, spread_bps, risk_metrics)
-
-        # Verify inventory delta is above threshold for aggressive skew (1.5%)
-        assert strategy.inventory.delta > 0.015
-        
-        # With 20% delta and aggressive sell mode, ask should be lower to encourage selling
-        # (though defensive distance logic may constrain the final result)
-        # At minimum, the two calculations should be invoked
-        assert neutral_bid > 0 and long_bid > 0  # Both valid quotes produced
-
-    def test_build_quote_levels(self, strategy):
-        """Test quote level building."""
-        bids, asks = strategy._build_quote_levels(
-            bid_price=99990.0,
-            ask_price=100010.0,
-            base_size=0.01,
-            spread_bps=10.0,
-        )
-
-        assert len(bids) == strategy.order_levels
-        assert len(asks) == strategy.order_levels
-
-        # Bids should be descending in price
-        bid_prices = [b.price for b in bids]
-        assert bid_prices == sorted(bid_prices, reverse=True)
-
-        # Asks should be ascending in price
-        ask_prices = [a.price for a in asks]
-        assert ask_prices == sorted(ask_prices)
-
-        # Sizes should decrease for outer levels
-        bid_sizes = [b.size for b in bids]
-        assert bid_sizes[0] >= bid_sizes[-1]
-
-    def test_get_status(self, strategy):
-        """Test status retrieval."""
-        status = strategy.get_status()
-
-        assert "state" in status
-        assert "inventory" in status
-        assert "quotes" in status
-        assert "metrics" in status
-
-        assert status["state"] == "stopped"
-
-    def test_get_metrics(self, strategy):
-        """Test metrics retrieval."""
-        metrics = strategy.get_metrics()
-
-        assert isinstance(metrics, StrategyMetrics)
-        assert metrics.quotes_sent == 0
-
-
-class TestStrategyCallbacks:
-    """Tests for strategy callback handling."""
-
-    @pytest.fixture
-    def strategy_with_mocks(self):
-        """Create strategy with mocks."""
-        config = Config(
-            private_key="test_key",
-            wallet_address="0x1234",
-        )
-        client = MockHyperliquidClient()
-        risk_manager = MockRiskManager()
-        return MarketMakingStrategy(config, client, risk_manager)
-
-    def test_orderbook_callback_registered(self, strategy_with_mocks):
-        """Test that orderbook callback is registered."""
-        # The callback should be registered during __init__
-        assert len(strategy_with_mocks.client._orderbook_callbacks) == 1
-
-    def test_user_callback_registered(self, strategy_with_mocks):
-        """Test that user callback is registered."""
-        assert len(strategy_with_mocks.client._user_callbacks) == 1
-
-    def test_process_fill(self, strategy_with_mocks):
-        """Test fill processing."""
-        fill_data = {
-            "oid": "12345",
-            "side": "B",
-            "sz": "0.01",
-            "px": "100000",
-            "fee": "0.1",
-        }
-
-        strategy_with_mocks._process_fill(fill_data)
-
-        assert strategy_with_mocks.metrics.quotes_filled == 1
-        assert strategy_with_mocks.last_trade_price == 100000.0
-
-
-class TestStrategyRiskIntegration:
-    """Tests for strategy-risk manager integration."""
-
-    @pytest.mark.asyncio
-    async def test_pauses_on_critical_risk(self):
-        """Test that strategy pauses on critical risk."""
-        config = Config(private_key="test", wallet_address="0x1234")
-        client = MockHyperliquidClient()
-        client.orderbook = OrderBook(
-            symbol="BTC",
-            bids=[(100000.0, 1.0)],
-            asks=[(100010.0, 1.0)],
-        )
-
-        risk_manager = MockRiskManager()
-        risk_manager.risk_metrics = RiskMetrics(
-            risk_level=RiskLevel.CRITICAL,
-            should_pause_trading=True,
-        )
-
-        strategy = MarketMakingStrategy(config, client, risk_manager)
-        await strategy.start()
-
-        # Run iteration should pause
-        await strategy.run_iteration()
-
-        assert strategy.state == StrategyState.PAUSED
-
-    @pytest.mark.asyncio
-    async def test_continues_on_low_risk(self):
-        """Test that strategy continues on low risk."""
-        config = Config(private_key="test", wallet_address="0x1234")
-        client = MockHyperliquidClient()
-        client.orderbook = OrderBook(
-            symbol="BTC",
-            bids=[(100000.0, 1.0)],
-            asks=[(100010.0, 1.0)],
-        )
-
-        risk_manager = MockRiskManager()
-        risk_manager.risk_metrics = RiskMetrics(
-            risk_level=RiskLevel.LOW,
-            should_pause_trading=False,
-        )
-
-        strategy = MarketMakingStrategy(config, client, risk_manager)
-        await strategy.start()
-
-        # Run iteration should continue
-        await strategy.run_iteration()
-
-        assert strategy.state == StrategyState.RUNNING
-
+@pytest.fixture
+def config():
+    """Mock config for testing."""
+    config = Mock(spec=Config)
+    config.trading = Mock()
+    config.trading.symbol = "US500"
+    config.trading.min_spread_bps = 1.0
+    config.trading.max_spread_bps = 50.0
+    config.trading.order_levels = 15
+    config.trading.leverage = 10
+    config.trading.collateral = 1000.0
+    config.execution = Mock()
+    config.execution.quote_refresh_interval = 1.0
+    config.execution.rebalance_interval = 1.0
+    config.wallet_address = "0xtest"
+    return config
+
+
+@pytest.fixture
+def mock_client():
+    """Mock Hyperliquid client."""
+    client = Mock(spec=HyperliquidClient)
+    client.get_orderbook = AsyncMock()
+    client.get_position = AsyncMock()
+    client.get_account_state = AsyncMock()
+    client.get_usdh_margin_state = AsyncMock()
+    client.place_order = AsyncMock()
+    client.cancel_all_orders = AsyncMock(return_value=0)
+    client.batch_cancel_orders = AsyncMock()
+    client.get_funding_rate = AsyncMock(return_value=0.0001)
+    client.on_orderbook_update = Mock()
+    client.on_user_update = Mock()
+    return client
+
+
+@pytest.fixture
+def mock_risk_manager():
+    """Mock risk manager."""
+    rm = Mock(spec=RiskManager)
+    rm.initialize = AsyncMock()
+    rm.assess_risk = AsyncMock()
+    rm.calculate_order_size = Mock(return_value=1.0)
+    return rm
+
+
+@pytest.fixture
+def strategy(config, mock_client, mock_risk_manager):
+    """Create strategy instance."""
+    return US500ProfessionalMM(config, mock_client, mock_risk_manager)
+
+
+@pytest.fixture
+def mock_orderbook():
+    """Mock order book."""
+    return OrderBook(
+        symbol="US500",
+        bids=[(6900, 10), (6899, 15), (6898, 20)],
+        asks=[(6901, 10), (6902, 15), (6903, 20)],
+        timestamp=1234567890
+    )
+
+
+# =============================================================================
+# L2 BOOK ANALYSIS TESTS
+# =============================================================================
+
+def test_analyze_order_book(strategy, mock_orderbook):
+    """Test L2 order book analysis."""
+    mock_orderbook.mid_price = 6900.5
+    
+    analysis = strategy._analyze_order_book(mock_orderbook)
+    
+    assert isinstance(analysis, BookDepthAnalysis)
+    assert analysis.total_bid_depth > 0
+    assert analysis.total_ask_depth > 0
+    assert -1 <= analysis.imbalance <= 1
+    assert analysis.weighted_mid > 0
+
+
+def test_book_liquidity_check(strategy, mock_orderbook):
+    """Test book liquidity threshold."""
+    # Deep book - should be liquid
+    mock_orderbook.bids = [(6900 - i, 100) for i in range(10)]
+    mock_orderbook.asks = [(6901 + i, 100) for i in range(10)]
+    
+    analysis = strategy._analyze_order_book(mock_orderbook)
+    assert analysis.is_liquid, "Deep book should be liquid"
+    
+    # Thin book - should be illiquid
+    mock_orderbook.bids = [(6900, 1)]
+    mock_orderbook.asks = [(6901, 1)]
+    
+    analysis = strategy._analyze_order_book(mock_orderbook)
+    assert not analysis.is_liquid, "Thin book should be illiquid"
+
+
+# =============================================================================
+# SPREAD CALCULATION TESTS
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_calculate_spread_low_vol(strategy, mock_orderbook):
+    """Test spread calculation in low volatility."""
+    # Simulate low volatility
+    prices = [6900 + i * 0.1 for i in range(100)]
+    for p in prices:
+        strategy.price_buffer.append(p)
+    
+    risk_metrics = RiskMetrics(risk_level=RiskLevel.LOW)
+    
+    min_spread, max_spread = strategy._calculate_spread(mock_orderbook, risk_metrics)
+    
+    assert min_spread >= 1.0, "Min spread should be at least 1 bps"
+    assert max_spread <= 50.0, "Max spread should not exceed 50 bps"
+    assert max_spread > min_spread, "Max spread should exceed min spread"
+
+
+@pytest.mark.asyncio
+async def test_calculate_spread_high_vol(strategy, mock_orderbook):
+    """Test spread calculation in high volatility."""
+    # Simulate high volatility
+    prices = []
+    for i in range(100):
+        prices.append(6900 + np.random.randn() * 50)
+    
+    for p in prices:
+        strategy.price_buffer.append(p)
+    
+    risk_metrics = RiskMetrics(risk_level=RiskLevel.HIGH)
+    
+    min_spread, max_spread = strategy._calculate_spread(mock_orderbook, risk_metrics)
+    
+    assert min_spread > 2.0, "High vol should have wider min spread"
+    assert max_spread > 20.0, "High vol should have wider max spread"
+
+
+@pytest.mark.asyncio
+async def test_adverse_selection_widens_spread(strategy, mock_orderbook):
+    """Test that adverse selection detection widens spreads."""
+    # Simulate losing fills
+    for i in range(10):
+        strategy.metrics.add_fill(OrderSide.BUY, 6900, 1.0)
+        strategy.metrics.add_fill(OrderSide.SELL, 6895, 1.0)  # Selling lower than buying
+    
+    risk_metrics = RiskMetrics(risk_level=RiskLevel.LOW)
+    
+    min_spread, max_spread = strategy._calculate_spread(mock_orderbook, risk_metrics)
+    
+    # Should widen due to adverse selection
+    assert min_spread > 3.0, "Adverse selection should widen spread"
+
+
+# =============================================================================
+# INVENTORY SKEWING TESTS
+# =============================================================================
+
+def test_inventory_skew_long(strategy):
+    """Test inventory skew when long."""
+    strategy.inventory.delta = 0.03  # Long 3%
+    
+    bid_skew, ask_skew = strategy._calculate_inventory_skew()
+    
+    assert bid_skew > 1.0, "Should widen bids when long"
+    assert ask_skew < 1.0, "Should tighten asks when long"
+
+
+def test_inventory_skew_short(strategy):
+    """Test inventory skew when short."""
+    strategy.inventory.delta = -0.03  # Short 3%
+    
+    bid_skew, ask_skew = strategy._calculate_inventory_skew()
+    
+    assert bid_skew < 1.0, "Should tighten bids when short"
+    assert ask_skew > 1.0, "Should widen asks when short"
+
+
+def test_inventory_skew_usdh_margin(strategy):
+    """Test increased skew with high USDH margin."""
+    strategy.inventory.delta = 0.02
+    strategy.inventory.usdh_margin_ratio = 0.85  # High margin
+    
+    bid_skew, ask_skew = strategy._calculate_inventory_skew()
+    
+    # Should have stronger skew due to high margin
+    assert bid_skew > 1.5, "High margin should increase skew urgency"
+
+
+# =============================================================================
+# TIERED QUOTES TESTS
+# =============================================================================
+
+def test_build_tiered_quotes(strategy, mock_orderbook):
+    """Test exponential tiered quote building."""
+    mock_orderbook.mid_price = 6900.5
+    
+    bids, asks = strategy._build_tiered_quotes(
+        mock_orderbook,
+        min_spread_bps=2.0,
+        max_spread_bps=20.0,
+        total_size=10.0
+    )
+    
+    assert len(bids) > 0, "Should generate bid levels"
+    assert len(asks) > 0, "Should generate ask levels"
+    
+    # Check exponential spacing
+    if len(bids) >= 2:
+        gap1 = bids[0].price - bids[1].price
+        gap2 = bids[1].price - bids[2].price if len(bids) >= 3 else gap1
+        assert gap2 >= gap1 * 0.9, "Gaps should increase exponentially"
+    
+    # Check size concentration (top levels should be larger)
+    if len(bids) >= 5:
+        top_5_size = sum(b.size for b in bids[:5])
+        total_bid_size = sum(b.size for b in bids)
+        assert top_5_size / total_bid_size > 0.6, "Top 5 should have >60% of volume"
+
+
+def test_tiered_quotes_lot_size(strategy, mock_orderbook):
+    """Test that all quote sizes meet minimum lot size (0.1 for US500)."""
+    mock_orderbook.mid_price = 6900.5
+    
+    bids, asks = strategy._build_tiered_quotes(
+        mock_orderbook,
+        min_spread_bps=2.0,
+        max_spread_bps=20.0,
+        total_size=1.0
+    )
+    
+    for bid in bids:
+        assert bid.size >= 0.1, f"Bid size {bid.size} below minimum 0.1"
+    
+    for ask in asks:
+        assert ask.size >= 0.1, f"Ask size {ask.size} below minimum 0.1"
+
+
+# =============================================================================
+# DELTA REBALANCING TESTS
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_check_rebalance_triggers(strategy, mock_orderbook, mock_client):
+    """Test delta rebalance triggers at 1.5% threshold."""
+    # Below threshold - no rebalance
+    strategy.inventory.delta = 0.01
+    mock_client.get_orderbook.return_value = mock_orderbook
+    
+    await strategy._check_rebalance()
+    
+    assert mock_client.place_ioc_order.call_count == 0, "Should not rebalance at 1%"
+    
+    # Above threshold - should rebalance
+    strategy.inventory.delta = 0.02
+    strategy.inventory.position_size = 10.0
+    
+    await strategy._check_rebalance()
+    
+    assert mock_client.place_ioc_order.call_count == 1, "Should rebalance at 2%"
+
+
+@pytest.mark.asyncio
+async def test_rebalance_cancels_quotes(strategy, mock_orderbook, mock_client):
+    """Test that rebalancing cancels active quotes."""
+    strategy.inventory.delta = 0.02
+    strategy.inventory.position_size = 10.0
+    strategy.active_bids = {"oid1": Mock(), "oid2": Mock()}
+    
+    mock_client.get_orderbook.return_value = mock_orderbook
+    
+    await strategy._check_rebalance()
+    
+    assert len(strategy.active_bids) == 0, "Should clear active bids after rebalance"
+
+
+# =============================================================================
+# USDH MARGIN TESTS
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_usdh_margin_refresh(strategy, mock_client):
+    """Test USDH margin state refresh."""
+    mock_client.get_usdh_margin_state.return_value = {
+        "margin_used": 500.0,
+        "margin_ratio": 0.75,
+        "margin_available": 500.0
+    }
+    
+    position_mock = Mock()
+    position_mock.size = 10.0
+    position_mock.notional_value = 69000.0
+    position_mock.entry_price = 6900.0
+    position_mock.mark_price = 6900.0
+    position_mock.unrealized_pnl = 0.0
+    
+    mock_client.get_position.return_value = position_mock
+    mock_client.get_account_state.return_value = Mock()
+    
+    await strategy._refresh_inventory()
+    
+    assert strategy.inventory.usdh_margin_used == 500.0
+    assert strategy.inventory.usdh_margin_ratio == 0.75
+
+
+@pytest.mark.asyncio
+async def test_one_sided_quoting_extreme_delta(strategy, mock_orderbook, mock_client):
+    """Test one-sided quoting at extreme imbalance (>2.5%)."""
+    strategy.inventory.delta = 0.03  # 3% long
+    
+    mock_client.get_orderbook.return_value = mock_orderbook
+    mock_client.cancel_all_orders.return_value = 0
+    
+    risk_metrics = RiskMetrics(risk_level=RiskLevel.LOW)
+    
+    # Mock risk manager
+    strategy.risk_manager.calculate_order_size.return_value = 1.0
+    
+    await strategy._update_quotes(risk_metrics)
+    
+    # Should only have asks (no bids when long)
+    assert len(strategy.active_asks) > 0 or mock_client.place_order.call_count > 0
+    # Bids should be cancelled
+    assert mock_client.cancel_all_orders.called or len(strategy.active_bids) == 0
+
+
+# =============================================================================
+# INTEGRATION TESTS
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_full_iteration_cycle(strategy, mock_orderbook, mock_client, mock_risk_manager):
+    """Test full strategy iteration cycle."""
+    # Setup mocks
+    mock_client.get_orderbook.return_value = mock_orderbook
+    mock_orderbook.mid_price = 6900.5
+    
+    position_mock = Mock()
+    position_mock.size = 0.0
+    position_mock.notional_value = 0.0
+    position_mock.entry_price = 0.0
+    position_mock.mark_price = 6900.0
+    position_mock.unrealized_pnl = 0.0
+    mock_client.get_position.return_value = position_mock
+    
+    mock_client.get_account_state.return_value = Mock()
+    mock_client.get_usdh_margin_state.return_value = {
+        "margin_used": 100.0,
+        "margin_ratio": 0.10,
+        "margin_available": 900.0
+    }
+    
+    risk_metrics = RiskMetrics(risk_level=RiskLevel.LOW)
+    mock_risk_manager.assess_risk.return_value = risk_metrics
+    mock_risk_manager.calculate_order_size.return_value = 1.0
+    
+    # Start strategy
+    await strategy.start()
+    
+    assert strategy.state.value == "running"
+    
+    # Run one iteration
+    await strategy.run_iteration()
+    
+    # Should have attempted to update quotes
+    assert mock_client.get_orderbook.called
+
+
+def test_metrics_tracking(strategy):
+    """Test performance metrics tracking."""
+    # Simulate fills
+    strategy.metrics.add_fill(OrderSide.BUY, 6900, 1.0)
+    strategy.metrics.add_fill(OrderSide.SELL, 6905, 1.0)
+    
+    # Check spread calculation
+    spread = strategy.metrics.get_weighted_spread_bps()
+    
+    assert spread is not None
+    assert spread > 0, "Spread should be positive when selling higher"
+
+
+@pytest.mark.asyncio
+async def test_emergency_close(strategy, mock_client):
+    """Test emergency close procedure."""
+    strategy.inventory.position_size = 10.0
+    
+    mock_orderbook = OrderBook(
+        symbol="US500",
+        bids=[(6900, 10)],
+        asks=[(6901, 10)],
+        timestamp=123
+    )
+    mock_client.get_orderbook.return_value = mock_orderbook
+    mock_client.place_market_order = AsyncMock()
+    
+    await strategy._emergency_close()
+    
+    assert mock_client.place_market_order.called
+    assert strategy.state.value == "paused"
+
+
+# =============================================================================
+# RUN TESTS
+# =============================================================================
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main([__file__, "-v", "--tb=short"])

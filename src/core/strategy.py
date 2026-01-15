@@ -281,7 +281,7 @@ class US500ProfessionalMM:
     TAKER_FEE = 0.00035  # 0.035%
     
     # Professional MM parameters - MODIFIED FOR 200 ORDERS
-    QUOTE_REFRESH_INTERVAL = 2.0  # 2s for stability with 200 orders
+    QUOTE_REFRESH_INTERVAL = 0.5  # 0.5s for HFT order placement
     MIN_ORDER_AGE_SECONDS = 30.0  # Keep orders longer - memorize until filled or replaced
     MAX_LEVELS_PER_SIDE = 100  # 100 bids + 100 asks = 200 total
     MIN_BOOK_DEPTH_USD = 5000  # US500 threshold
@@ -341,7 +341,7 @@ class US500ProfessionalMM:
         self.max_spread_bps = 200.0  # ±2% = 200 bps
         self.order_levels = 100  # 100 levels per side
         self.quote_interval = 2.0  # Slower refresh with 200 orders
-        self.rebalance_interval = 2.0  # 2s rebalance
+        self.rebalance_interval = 1.0  # 1s rebalance
         
         # Order memorization tracking
         self._order_memory: Dict[str, QuoteLevel] = {}  # All orders ever placed
@@ -768,12 +768,12 @@ class US500ProfessionalMM:
         """
         Build 100 levels per side with ±2% range.
         
-        MODIFIED FOR 200 ORDERS:
-        - 100 bids from mid-2% to mid
-        - 100 asks from mid to mid+2%
-        - Total notional: $10,000 per side ($20,000 total)
-        - Linear spacing across ±2% range
-        - Uniform sizing to hit $10k limit
+        ULTRA-SMART SIZING WITH L2 ANALYSIS:
+        - Analyzes L2 book depth at each price level
+        - Larger sizes in liquid pockets (more book depth)
+        - Smaller sizes where thin (less book depth)
+        - Target: $10,000 notional per side
+        - Orders from closest (tightest spread) to furthest (±2%)
         """
         if not orderbook.mid_price or not orderbook.best_bid or not orderbook.best_ask:
             logger.warning(f"Orderbook incomplete: mid={orderbook.mid_price}, bid={orderbook.best_bid}, ask={orderbook.best_ask}")
@@ -791,57 +791,110 @@ class US500ProfessionalMM:
         # Number of levels per side
         total_levels = self.MAX_LEVELS_PER_SIDE
         
-        # Calculate uniform size to hit $10k notional per side
-        # notional = sum(price_i * size_i) ≈ avg_price * total_size
-        avg_bid_price = (bid_start + mid) / 2
-        avg_ask_price = (mid + ask_end) / 2
-        
-        # Target: $10k per side
-        target_bid_notional = self.MAX_NOTIONAL_PER_SIDE
-        target_ask_notional = self.MAX_NOTIONAL_PER_SIDE
-        
-        # Size per level (uniform distribution)
-        size_per_bid = (target_bid_notional / avg_bid_price) / total_levels
-        size_per_ask = (target_ask_notional / avg_ask_price) / total_levels
-        
-        # Rounding
+        # SMART SIZING: Calculate depth-weighted sizes
+        # Analyze orderbook liquidity at each level
         tick_size = 0.01  # US500 tick
         lot_size = 0.1  # US500 lot
         
-        size_per_bid = max(round_size(size_per_bid, lot_size), lot_size)
-        size_per_ask = max(round_size(size_per_ask, lot_size), lot_size)
+        # Build depth map from orderbook
+        bid_depth_map = {price: size for price, size in orderbook.bids}
+        ask_depth_map = {price: size for price, size in orderbook.asks}
         
-        # Build bids (mid to mid-2%)
+        # Calculate sizes based on local liquidity
+        bid_sizes = []
+        ask_sizes = []
+        
+        # Target: $10k notional per side
+        target_notional = self.MAX_NOTIONAL_PER_SIDE
+        
+        # Build bids from CLOSEST to FURTHEST (mid to mid-2%)
         for i in range(total_levels):
             t = i / (total_levels - 1) if total_levels > 1 else 0
             bid_price = round_price(mid - (mid - bid_start) * t, tick_size)
             
             if bid_price > 0 and bid_price < mid:
-                bids.append(QuoteLevel(
-                    price=bid_price,
-                    size=size_per_bid,
-                    side=OrderSide.BUY,
-                    created_at=time.time()
-                ))
+                # Smart sizing: check local book depth
+                local_depth = bid_depth_map.get(bid_price, 0)
+                
+                # Size scales with local depth (0.5x to 2.0x base size)
+                # More depth = larger size, less depth = smaller size
+                depth_factor = 1.0
+                if local_depth > 10:
+                    depth_factor = 1.5  # Liquid pocket
+                elif local_depth > 5:
+                    depth_factor = 1.2
+                elif local_depth < 1:
+                    depth_factor = 0.7  # Thin area
+                
+                bid_sizes.append(depth_factor)
         
-        # Build asks (mid to mid+2%)
+        # Build asks from CLOSEST to FURTHEST (mid to mid+2%)
         for i in range(total_levels):
             t = i / (total_levels - 1) if total_levels > 1 else 0
             ask_price = round_price(mid + (ask_end - mid) * t, tick_size)
             
             if ask_price > mid:
+                # Smart sizing: check local book depth
+                local_depth = ask_depth_map.get(ask_price, 0)
+                
+                depth_factor = 1.0
+                if local_depth > 10:
+                    depth_factor = 1.5  # Liquid pocket
+                elif local_depth > 5:
+                    depth_factor = 1.2
+                elif local_depth < 1:
+                    depth_factor = 0.7  # Thin area
+                
+                ask_sizes.append(depth_factor)
+        
+        # Normalize sizes to hit target notional
+        total_bid_weight = sum(bid_sizes)
+        total_ask_weight = sum(ask_sizes)
+        
+        avg_bid_price = (bid_start + mid) / 2
+        avg_ask_price = (mid + ask_end) / 2
+        
+        # Scale to target notional
+        bid_notional_per_unit = target_notional / (total_bid_weight * avg_bid_price) if total_bid_weight > 0 else 0
+        ask_notional_per_unit = target_notional / (total_ask_weight * avg_ask_price) if total_ask_weight > 0 else 0
+        
+        # Build final bid orders with smart sizes
+        bid_idx = 0
+        for i in range(total_levels):
+            t = i / (total_levels - 1) if total_levels > 1 else 0
+            bid_price = round_price(mid - (mid - bid_start) * t, tick_size)
+            
+            if bid_price > 0 and bid_price < mid and bid_idx < len(bid_sizes):
+                size = max(round_size(bid_sizes[bid_idx] * bid_notional_per_unit, lot_size), lot_size)
+                bids.append(QuoteLevel(
+                    price=bid_price,
+                    size=size,
+                    side=OrderSide.BUY,
+                    created_at=time.time()
+                ))
+                bid_idx += 1
+        
+        # Build final ask orders with smart sizes
+        ask_idx = 0
+        for i in range(total_levels):
+            t = i / (total_levels - 1) if total_levels > 1 else 0
+            ask_price = round_price(mid + (ask_end - mid) * t, tick_size)
+            
+            if ask_price > mid and ask_idx < len(ask_sizes):
+                size = max(round_size(ask_sizes[ask_idx] * ask_notional_per_unit, lot_size), lot_size)
                 asks.append(QuoteLevel(
                     price=ask_price,
-                    size=size_per_ask,
+                    size=size,
                     side=OrderSide.SELL,
                     created_at=time.time()
                 ))
+                ask_idx += 1
         
-        # Log first and last levels
+        # Log first and last levels with sizes
         if bids:
-            logger.debug(f"Built {len(bids)} bids: {bids[0].price:.2f} to {bids[-1].price:.2f} (size={size_per_bid:.2f})")
+            logger.debug(f"Built {len(bids)} smart-sized bids: {bids[0].price:.2f} (size={bids[0].size:.2f}) to {bids[-1].price:.2f} (size={bids[-1].size:.2f})")
         if asks:
-            logger.debug(f"Built {len(asks)} asks: {asks[0].price:.2f} to {asks[-1].price:.2f} (size={size_per_ask:.2f})")
+            logger.debug(f"Built {len(asks)} smart-sized asks: {asks[0].price:.2f} (size={asks[0].size:.2f}) to {asks[-1].price:.2f} (size={asks[-1].size:.2f})")
         
         return bids, asks
     
@@ -862,7 +915,7 @@ class US500ProfessionalMM:
         6. Handle one-sided quoting (extreme imbalance >2.5%)
         7. Smart cancel/replace on book moves >0.1%
         """
-        # Check interval (1s for HFT)
+        # Check interval (0.5s for HFT)
         now = time.time()
         if now - self.last_quote_time < self.QUOTE_REFRESH_INTERVAL:
             return
@@ -872,35 +925,38 @@ class US500ProfessionalMM:
         # Get orderbook
         orderbook = await self._get_cached_orderbook()
         if not orderbook or not orderbook.mid_price:
-            logger.warning("No orderbook")
+            logger.warning("No orderbook available")
             return
+        
+        logger.debug(f"Updating quotes: mid=${orderbook.mid_price:.2f}, bid=${orderbook.best_bid:.2f}, ask=${orderbook.best_ask:.2f}")
         
         # Update price buffer
         self.price_buffer.append(orderbook.mid_price)
         self.last_mid_price = orderbook.mid_price
         
-        # Analyze L2
+        # COMPLEX ORDERBOOK ANALYSIS
         self.last_book_analysis = self._analyze_order_book(orderbook)
         
-        # Check liquidity
+        # Check liquidity - protect against thin books
         if not self.last_book_analysis.is_liquid:
             logger.debug(f"Illiquid book: bids=${self.last_book_analysis.total_bid_depth:.0f}, asks=${self.last_book_analysis.total_ask_depth:.0f}")
             await self._cancel_all_quotes()
             return
         
-        # Calculate spread
+        # Calculate spread with volatility adaptation
         min_spread, max_spread = self._calculate_spread(orderbook, risk_metrics)
         
-        # Calculate size (total size across all levels)
+        # SMART SIZING: Risk-adjusted order size calculation
         per_level_size = self.risk_manager.calculate_order_size(
             orderbook.mid_price, "both", risk_metrics
         )
         
-        # Total size = per-level size * number of levels (but scale down since inner levels are smaller)
-        # With exponential decay (85%), effective levels ≈ 5-7, so use 6x multiplier
+        # Total size across all levels with exponential decay
+        # With 85% decay, effective levels ≈ 5-7, so use 6x multiplier
         total_size = per_level_size * 6.0
         
         if total_size <= 0:
+            logger.warning("Risk manager returned zero size - cancelling quotes")
             await self._cancel_all_quotes()
             return
         
@@ -908,6 +964,8 @@ class US500ProfessionalMM:
         new_bids, new_asks = self._build_tiered_quotes(
             orderbook, min_spread, max_spread, total_size
         )
+        
+        logger.info(f"Built {len(new_bids)} bids + {len(new_asks)} asks, total_size={total_size:.2f}")
         
         # Handle one-sided quoting (extreme imbalance >5% - increased from 2.5%)
         # CRITICAL FIX: 2.5% was too aggressive, causing stuck one-sided state
@@ -988,6 +1046,9 @@ class US500ProfessionalMM:
             await self._batch_cancel(to_cancel_bids + to_cancel_asks)
         
         # Place new orders
+        bids_to_place = 0
+        asks_to_place = 0
+        
         for bid in new_bids:
             # Check if we already have an order at this price
             existing = any(
@@ -995,6 +1056,7 @@ class US500ProfessionalMM:
                 for level in self.active_bids.values()
             )
             if not existing:
+                bids_to_place += 1
                 await self._place_quote(bid)
         
         for ask in new_asks:
@@ -1003,7 +1065,11 @@ class US500ProfessionalMM:
                 for level in self.active_asks.values()
             )
             if not existing:
+                asks_to_place += 1
                 await self._place_quote(ask)
+        
+        if bids_to_place > 0 or asks_to_place > 0:
+            logger.info(f\"Placed {bids_to_place} new bids + {asks_to_place} new asks\")
     
     async def _place_quote(self, quote: QuoteLevel) -> None:
         """Place a single quote with order memorization."""
