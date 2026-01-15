@@ -149,6 +149,17 @@ class OrderBook:
     asks: List[Tuple[float, float]] = field(default_factory=list)
     timestamp: int = 0
 
+
+@dataclass
+class USDHMarginState:
+    """USDH margin state (HIP-3)."""
+    
+    total_usdh_margin: float  # Total USDH margin used
+    available_usdh: float  # Available USDH for new positions
+    usdh_margin_ratio: float  # Margin used / total (0-0.9)
+    maintenance_margin: float  # Min margin to avoid liquidation
+    account_value: float  # Total account value in USDH
+
     @property
     def best_bid(self) -> Optional[float]:
         return self.bids[0][0] if self.bids else None
@@ -1859,6 +1870,56 @@ class HyperliquidClient:
 
         await self._refresh_account_state()
         return self._positions.get(symbol)
+    
+    async def get_usdh_margin_state(self) -> Optional[USDHMarginState]:
+        """
+        Get USDH margin state (HIP-3).
+        
+        Returns:
+            USDHMarginState with margin ratios and available USDH, or None if unavailable
+        \"\"\"
+        if not self._info:
+            return None
+        
+        try:
+            # Query clearinghouse state for USDH margin info
+            user_state = self._info.user_state(self.config.wallet.address)
+            
+            if not user_state or \"marginSummary\" not in user_state:
+                logger.debug(\"No margin summary in user state\")
+                return None
+            
+            margin = user_state[\"marginSummary\"]
+            account_value = float(margin.get(\"accountValue\", 0))
+            total_margin_used = float(margin.get(\"totalMarginUsed\", 0))
+            total_ntl_pos = float(margin.get(\"totalNtlPos\", 0))
+            withdrawable = float(margin.get(\"withdrawable\", 0))
+            
+            # Calculate USDH margin ratio
+            usdh_margin_ratio = total_margin_used / account_value if account_value > 0 else 0.0
+            
+            # Get maintenance margin
+            maintenance_margin = float(margin.get(\"totalRawUsd\", 0)) * 0.03  # 3% maintenance
+            
+            margin_state = USDHMarginState(
+                total_usdh_margin=total_margin_used,
+                available_usdh=withdrawable,
+                usdh_margin_ratio=usdh_margin_ratio,
+                maintenance_margin=maintenance_margin,
+                account_value=account_value
+            )
+            
+            logger.debug(
+                f\"USDH Margin: {usdh_margin_ratio:.1%} used, \"
+                f\"${available_usdh:,.2f} available, \"
+                f\"${account_value:,.2f} total\"
+            )
+            
+            return margin_state
+            
+        except Exception as e:
+            logger.error(f\"Failed to get USDH margin state: {e}\")
+            return None
 
     @retry(
         stop=stop_after_attempt(5),  # Increased from 3 to 5 retries for better reliability

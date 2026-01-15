@@ -336,17 +336,22 @@ class HyperliquidDataFetcher:
 
 class US500DataManager:
     """
-    Manages US500 historical data with automatic BTC proxy fallback.
+    Manages US500 historical data with xyz100 PRIMARY and BTC fallback.
     
     This class handles:
-    1. Checking available US500 historical data
-    2. Falling back to BTC data as proxy if insufficient
-    3. Scaling BTC data to approximate US500 volatility
-    4. Periodically checking for sufficient US500 data
+    1. PRIMARY: S&P 100 (^OEX) via yfinance (xyz100_fallback.py)
+    2. SECONDARY: Direct US500 via Hyperliquid API
+    3. FALLBACK: BTC data as proxy if both insufficient
+    4. Scaling for US500 volatility (5-15% target)
+    
+    Data source priority:
+    1. xyz100 (S&P 100, 0.98 correlation) - PREFERRED
+    2. US500 direct (if >50% bars available)
+    3. BTC scaled (last resort)
     
     Usage:
         manager = US500DataManager()
-        candles, funding, is_proxy = await manager.get_trading_data(days=180)
+        candles, funding, data_source = await manager.get_trading_data(days=180)
     """
     
     # US500 volatility is typically 20-30% of BTC volatility
@@ -355,11 +360,22 @@ class US500DataManager:
     # Minimum candles needed for reliable backtesting (6 months at 1m)
     MIN_CANDLES_FOR_TRADING = 259200  # 180 days * 24 * 60
     
-    def __init__(self, data_dir: str = "data"):
+    def __init__(self, data_dir: str = "data", use_xyz100_primary: bool = True):
         """Initialize the data manager."""
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
         self.fetcher = HyperliquidDataFetcher(use_testnet=False)
+        self.use_xyz100_primary = use_xyz100_primary
+        
+        # Import xyz100 fetcher
+        try:
+            from src.utils.xyz100_fallback import XYZ100FallbackFetcher
+            self.xyz100_fetcher = XYZ100FallbackFetcher()
+            logger.info("xyz100 (S&P 100) fetcher initialized as PRIMARY data source")
+        except ImportError as e:
+            logger.warning(f"xyz100_fallback not available: {e}")
+            self.xyz100_fetcher = None
+            self.use_xyz100_primary = False
         
     async def close(self) -> None:
         """Close the data fetcher."""
@@ -396,8 +412,114 @@ class US500DataManager:
             df.to_csv(path, index=False)
             logger.debug(f"Saved {len(df)} records to cache: {path}")
         except Exception as e:
-            logger.warning(f"Failed to save cache {path}: {e}")
+            logger.warning(f"Failed to save cache {path}: {e}")    
+    async def get_trading_data(self, days: int = 180) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+        """
+        Get trading data with xyz100 PRIMARY and BTC fallback.
+        
+        Data source priority:
+        1. xyz100 (S&P 100 ^OEX) - PREFERRED, 0.98 correlation
+        2. US500 direct (if >50% bars available)
+        3. BTC scaled (last resort)
+        
+        Args:
+            days: Days of historical data to fetch
+            
+        Returns:
+            (candles_df, funding_df, data_source)
+            data_source: "xyz100", "us500", or "btc"
+        """
+        # Try xyz100 PRIMARY
+        if self.use_xyz100_primary and self.xyz100_fetcher:
+            try:
+                logger.info("Attempting xyz100 (S&P 100) as PRIMARY data source...")
+                xyz_df = await self.xyz100_fetcher.fetch_xyz100_data(days)
+                
+                if xyz_df is not None and len(xyz_df) >= days * 0.5:  # >50% bars
+                    logger.info(f"✅ xyz100 PRIMARY: {len(xyz_df)} bars ({len(xyz_df)/(days*390):.1%} of target)")
+                    # Funding not available for xyz100, create empty df
+                    funding_df = pd.DataFrame()
+                    return xyz_df, funding_df, "xyz100"
+                else:
+                    logger.warning(f"xyz100 insufficient: {len(xyz_df) if xyz_df is not None else 0} bars < {days*0.5:.0f}")
+            except Exception as e:
+                logger.warning(f"xyz100 fetch failed: {e}")
+        
+        # Try US500 direct SECONDARY
+        try:
+            logger.info("Attempting US500 direct as SECONDARY...")
+            us500_candles = await self.fetcher.fetch_candles("US500", days=days, interval="1m")
+            
+            if us500_candles and len(us500_candles) >= days * 0.5:  # >50% bars
+                candles_df = self._candles_to_dataframe(us500_candles)
+                logger.info(f"✅ US500 DIRECT: {len(candles_df)} bars")
+                
+                # Get funding rates
+                funding = await self.fetcher.fetch_funding_history("US500", days=days)
+                funding_df = self._funding_to_dataframe(funding) if funding else pd.DataFrame()
+                
+                return candles_df, funding_df, "us500"
+            else:
+                logger.warning(f"US500 insufficient: {len(us500_candles) if us500_candles else 0} bars")
+        except Exception as e:
+            logger.warning(f"US500 fetch failed: {e}")
+        
+        # Fallback to BTC LAST RESORT
+        logger.warning("⚠️ Using BTC FALLBACK (xyz100 and US500 insufficient)")
+        try:
+            btc_candles = await self.fetcher.fetch_candles("BTC", days=days, interval="1m")
+            if not btc_candles:
+                raise ValueError("No BTC data available")
+            
+            candles_df = self._candles_to_dataframe(btc_candles)
+            candles_df = self._scale_btc_to_us500(candles_df)
+            
+            logger.info(f"✅ BTC FALLBACK (scaled): {len(candles_df)} bars")
+            
+            # Get BTC funding (for reference)
+            funding = await self.fetcher.fetch_funding_history("BTC", days=days)
+            funding_df = self._funding_to_dataframe(funding) if funding else pd.DataFrame()
+            
+            return candles_df, funding_df, "btc"
+            
+        except Exception as e:
+            logger.error(f"BTC fallback failed: {e}")
+            # Return empty dataframes
+            return pd.DataFrame(), pd.DataFrame(), "none"
     
+    def _candles_to_dataframe(self, candles: List[CandleData]) -> pd.DataFrame:
+        """Convert candles to DataFrame."""
+        if not candles:
+            return pd.DataFrame()
+        
+        data = [
+            {
+                "datetime": pd.to_datetime(c.timestamp, unit="ms"),
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+                "volume": c.volume
+            }
+            for c in candles
+        ]
+        return pd.DataFrame(data)
+    
+    def _funding_to_dataframe(self, funding: List[FundingData]) -> pd.DataFrame:
+        """Convert funding to DataFrame."""
+        if not funding:
+            return pd.DataFrame()
+        
+        data = [
+            {
+                "datetime": pd.to_datetime(f.timestamp, unit="ms"),
+                "coin": f.coin,
+                "funding_rate": f.funding_rate,
+                "premium": f.premium
+            }
+            for f in funding
+        ]
+        return pd.DataFrame(data)    
     def _scale_btc_to_us500(self, btc_candles: pd.DataFrame) -> pd.DataFrame:
         """
         Scale BTC price data to approximate US500 characteristics.
