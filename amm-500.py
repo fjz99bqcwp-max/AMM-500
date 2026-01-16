@@ -591,6 +591,19 @@ For more information, see README.md
     parser.add_argument("--status", action="store_true", help="Check connection status and exit")
 
     parser.add_argument(
+        "--autonomous",
+        action="store_true",
+        help="Enable autonomous mode with kill switches (DD>2%%, taker>30%%, margin<10%%, 3 losing days, vol>15%%)",
+    )
+
+    parser.add_argument(
+        "--max-restarts",
+        type=int,
+        default=5,
+        help="Max auto-restarts per hour in autonomous mode (default: 5)",
+    )
+
+    parser.add_argument(
         "--config", type=str, default=None, help="Path to config file (default: config/.env)"
     )
 
@@ -616,6 +629,13 @@ def main() -> None:
     if args.reduce_only:
         config.execution.force_reduce_only = True
         logger.warning("⚠️ REDUCE-ONLY MODE FORCED - Will only close positions, no new opens")
+
+    # Handle autonomous mode
+    if hasattr(args, 'autonomous') and args.autonomous:
+        config.execution.autonomous_mode = True
+        max_restarts = getattr(args, 'max_restarts', 5)
+        logger.info(f"🤖 AUTONOMOUS MODE enabled with kill switches (max {max_restarts} restarts/hr)")
+        logger.info("  Kill triggers: DD>2%, taker>30%, margin<10%, 3 losing days, vol>15%")
 
     # Setup logging
     setup_logging(config)

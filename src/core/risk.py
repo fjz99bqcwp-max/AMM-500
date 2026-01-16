@@ -102,10 +102,10 @@ class RiskState:
     last_funding_time: float = 0.0
     current_delta: float = 0.0  # Current position delta
     
-    # ENHANCEMENT: Taker volume tracking
+    # ENHANCEMENT: Taker volume tracking - STRICT 5% cap for MM
     taker_volume_24h: float = 0.0  # Taker volume in last 24h
     maker_volume_24h: float = 0.0  # Maker volume in last 24h
-    taker_ratio_threshold: float = 0.10  # Max 10% taker volume
+    taker_ratio_threshold: float = 0.05  # Max 5% taker volume (stricter for professional MM)
 
 
 class RiskManager:
@@ -192,10 +192,13 @@ class RiskManager:
         try:
             account = await self.client.get_account_state()
             if account and account.equity > 1.0:
-                self.state.starting_equity = account.equity
-                self.state.peak_equity = account.equity
-                self._fill_based_equity = account.equity  # Sync fill-based with actual
-                logger.info(f"Risk manager initialized with equity: ${account.equity:,.2f}")
+                # Use the MAX of actual equity and configured collateral
+                # This handles cases where user added more funds than configured
+                initial_equity = max(account.equity, self.config.trading.collateral)
+                self.state.starting_equity = initial_equity
+                self.state.peak_equity = initial_equity
+                self._fill_based_equity = initial_equity
+                logger.info(f"Risk manager initialized with equity: ${initial_equity:,.2f}")
             else:
                 # Balance API returned $0, use configured collateral
                 self.state.starting_equity = self.config.trading.collateral
@@ -251,6 +254,15 @@ class RiskManager:
         self._fill_based_pnl = total_pnl
         self._fill_based_fees = total_fees
         self._fill_based_equity = self.config.trading.collateral + total_pnl - total_fees
+        
+        # CRITICAL: Update peak_equity to use fill-based equity as the baseline
+        # This prevents false drawdown alarms when balance API is unreliable
+        if self._fill_based_equity > self.state.peak_equity:
+            self.state.peak_equity = self._fill_based_equity
+        # If fill-based is lower than peak, use it as the new peak (account for withdrawals/losses)
+        elif self._fill_based_equity > 0:
+            # Reset peak to fill-based since that's our most accurate tracking
+            self.state.peak_equity = self._fill_based_equity
         
         logger.info(f"Synced fill-based tracking: equity=${self._fill_based_equity:.2f} (PnL: ${total_pnl:.2f}, fees: ${total_fees:.2f})")
 
@@ -413,11 +425,15 @@ class RiskManager:
         metrics.unrealized_pnl = account.unrealized_pnl
         metrics.realized_pnl = self.state.session_pnl - account.unrealized_pnl
 
+        # Use fill-based equity when balance API is unreliable (HIP-3)
+        # The balance API may show low values when margin is locked in orders
+        effective_equity = max(account.equity, self._fill_based_equity) if self._use_fill_tracking else account.equity
+        
         # Calculate current drawdown from peak
         if self.state.peak_equity > 0:
-            metrics.current_drawdown = (
-                self.state.peak_equity - account.equity
-            ) / self.state.peak_equity
+            metrics.current_drawdown = max(0, (
+                self.state.peak_equity - effective_equity
+            ) / self.state.peak_equity)
 
         metrics.max_drawdown = max(metrics.current_drawdown, metrics.max_drawdown)
 
@@ -564,10 +580,10 @@ class RiskManager:
         """
         Check if taker volume ratio is within acceptable limits.
         
-        PROFESSIONAL MM SAFEGUARD:
-        - Target: >90% maker volume (earn rebates)
-        - Warning: <90% maker (some taker fills)
-        - Pause: <80% maker (excessive taker fills)
+        PROFESSIONAL MM SAFEGUARD - STRICT 5% TAKER CAP:
+        - Target: >95% maker volume (earn rebates, professional MM)
+        - Warning: <95% maker (5-10% taker - widen spreads)
+        - Pause: <90% maker (>10% taker - unacceptable for MM)
         
         Returns True if trading should be paused.
         """
@@ -578,17 +594,19 @@ class RiskManager:
         taker_ratio = self.state.taker_volume_24h / total_volume
         maker_ratio = 1.0 - taker_ratio
         
-        if maker_ratio < 0.80:  # Less than 80% maker
+        if taker_ratio > 0.10:  # >10% taker - PAUSE
             logger.warning(
                 f"TAKER VOLUME TOO HIGH: {taker_ratio:.1%} taker, {maker_ratio:.1%} maker - "
                 "PAUSING to improve maker ratio"
             )
             metrics.should_pause_trading = True
             return True
-        elif maker_ratio < 0.90:  # Less than 90% maker
-            logger.info(
-                f"Taker volume elevated: {taker_ratio:.1%} taker, {maker_ratio:.1%} maker"
+        elif taker_ratio > 0.05:  # >5% taker - WARNING (target is <5%)
+            logger.warning(
+                f"Taker volume elevated: {taker_ratio:.1%} taker (target <5%) - widening spreads"
             )
+            # Signal to widen spreads
+            metrics.should_reduce_exposure = True
         
         return False
 
