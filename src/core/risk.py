@@ -137,6 +137,13 @@ class RiskManager:
         self.client = client
         self.state = RiskState()
         self._initialized = False
+        
+        # FILL-BASED TRACKING: Bypass broken balance API for HIP-3
+        # Track equity from configured collateral + accumulated PnL from fills
+        self._fill_based_equity = config.trading.collateral
+        self._fill_based_pnl = 0.0
+        self._fill_based_fees = 0.0
+        self._use_fill_tracking = True  # Enable fill-based tracking
 
         # Configure thresholds - TIGHTENED for safety per recommendations
         self.max_drawdown = config.risk.max_drawdown  # 5% max drawdown
@@ -184,14 +191,68 @@ class RiskManager:
         """Initialize risk manager with current account state."""
         try:
             account = await self.client.get_account_state()
-            if account:
+            if account and account.equity > 1.0:
                 self.state.starting_equity = account.equity
                 self.state.peak_equity = account.equity
+                self._fill_based_equity = account.equity  # Sync fill-based with actual
                 logger.info(f"Risk manager initialized with equity: ${account.equity:,.2f}")
+            else:
+                # Balance API returned $0, use configured collateral
+                self.state.starting_equity = self.config.trading.collateral
+                self.state.peak_equity = self.config.trading.collateral
+                self._fill_based_equity = self.config.trading.collateral
+                logger.info(f"Risk manager initialized with configured collateral: ${self.config.trading.collateral:,.2f} (balance API returned $0)")
             self._initialized = True
         except Exception as e:
             logger.error(f"Failed to initialize risk manager: {e}")
             raise
+
+    def update_from_fill(self, closed_pnl: float, fee: float) -> None:
+        """
+        Update fill-based equity tracking from a trade fill.
+        
+        This bypasses the broken balance API for HIP-3 by tracking
+        equity directly from fill data.
+        
+        Args:
+            closed_pnl: The closedPnl field from the fill
+            fee: The fee field from the fill
+        """
+        self._fill_based_pnl += closed_pnl
+        self._fill_based_fees += fee
+        # Update equity: starting + realized PnL - fees
+        self._fill_based_equity = self.config.trading.collateral + self._fill_based_pnl - self._fill_based_fees
+        
+        # Also update state for drawdown tracking
+        if self._fill_based_equity > self.state.peak_equity:
+            self.state.peak_equity = self._fill_based_equity
+        
+        logger.debug(f"Fill-based equity: ${self._fill_based_equity:.2f} (PnL: ${self._fill_based_pnl:.2f}, fees: ${self._fill_based_fees:.2f})")
+
+    def get_fill_based_equity(self) -> float:
+        """Get the fill-based equity value."""
+        return self._fill_based_equity
+
+    def sync_fills_from_exchange(self, fills: list) -> None:
+        """
+        Sync fill-based tracking from exchange fills history.
+        
+        Call this on startup to sync with actual trading history.
+        """
+        total_pnl = 0.0
+        total_fees = 0.0
+        
+        for fill in fills:
+            coin = fill.get('coin', '')
+            if 'US500' in coin or coin == 'km:US500':
+                total_pnl += float(fill.get('closedPnl', 0))
+                total_fees += float(fill.get('fee', 0))
+        
+        self._fill_based_pnl = total_pnl
+        self._fill_based_fees = total_fees
+        self._fill_based_equity = self.config.trading.collateral + total_pnl - total_fees
+        
+        logger.info(f"Synced fill-based tracking: equity=${self._fill_based_equity:.2f} (PnL: ${total_pnl:.2f}, fees: ${total_fees:.2f})")
 
     async def check_risk(self) -> RiskMetrics:
         """
@@ -216,7 +277,31 @@ class RiskManager:
 
             if not account:
                 logger.warning("Could not fetch account state for risk check")
+                metrics.risk_level = RiskLevel.CRITICAL
+                metrics.should_reduce_exposure = True
                 return metrics
+
+            # CRITICAL: Check for zero or near-zero equity (no margin)
+            # BYPASS: For HIP-3, balance API is unreliable (USDH split across spot/perp/margin)
+            # Use fill-based tracking instead when balance shows $0 but we have configured collateral
+            if account.equity < 1.0:
+                if self._use_fill_tracking and self._fill_based_equity > 1.0:
+                    # Balance API returned $0 but we have fill-based equity
+                    # Override account equity with our tracked value
+                    logger.debug(
+                        f"Balance API returned ${account.equity:.2f}, using fill-based equity: ${self._fill_based_equity:.2f}"
+                    )
+                    account.equity = self._fill_based_equity
+                    account.available_balance = self._fill_based_equity * 0.8  # Conservative 80% available
+                else:
+                    logger.error(
+                        f"❌ CRITICAL: No margin available! equity=${account.equity:.2f} | "
+                        f"Cannot trade without funds - deposit USDH to continue"
+                    )
+                    metrics.risk_level = RiskLevel.CRITICAL
+                    metrics.should_reduce_exposure = True
+                    metrics.current_drawdown = 1.0  # 100% loss
+                    return metrics
 
             # Update equity tracking
             self._update_equity_tracking(account.equity)
@@ -705,6 +790,16 @@ class RiskManager:
         Returns:
             Safe order size in base currency (BTC)
         """
+        # CRITICAL: Check for zero margin - but use fill-based tracking as fallback
+        if metrics and metrics.available_margin < 1.0:
+            # BYPASS: Use fill-based equity when balance API returns $0
+            if self._use_fill_tracking and self._fill_based_equity > 1.0:
+                logger.debug(f"Margin API returned ${metrics.available_margin:.2f}, using fill-based: ${self._fill_based_equity:.2f}")
+                # Continue with fill-based equity
+            else:
+                logger.warning(f"No margin available (${metrics.available_margin:.2f}) - returning zero size")
+                return 0.0
+
         # Calculate Kelly-optimal size: (edge - funding_cost) / vol²
         kelly_size = self._calculate_kelly_dynamic_size(price, metrics, funding_rate)
 

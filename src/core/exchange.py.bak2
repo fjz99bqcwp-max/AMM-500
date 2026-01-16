@@ -149,6 +149,17 @@ class OrderBook:
     asks: List[Tuple[float, float]] = field(default_factory=list)
     timestamp: int = 0
 
+
+@dataclass
+class USDHMarginState:
+    """USDH margin state (HIP-3)."""
+    
+    total_usdh_margin: float  # Total USDH margin used
+    available_usdh: float  # Available USDH for new positions
+    usdh_margin_ratio: float  # Margin used / total (0-0.9)
+    maintenance_margin: float  # Min margin to avoid liquidation
+    account_value: float  # Total account value in USDH
+
     @property
     def best_bid(self) -> Optional[float]:
         return self.bids[0][0] if self.bids else None
@@ -182,17 +193,6 @@ class OrderBook:
         if self.mid_price and self.spread:
             return (self.spread / self.mid_price) * 10000
         return None
-
-
-@dataclass
-class USDHMarginState:
-    """USDH margin state (HIP-3)."""
-    
-    total_usdh_margin: float  # Total USDH margin used
-    available_usdh: float  # Available USDH for new positions
-    usdh_margin_ratio: float  # Margin used / total (0-0.9)
-    maintenance_margin: float  # Min margin to avoid liquidation
-    account_value: float  # Total account value in USDH
 
 
 @dataclass
@@ -418,10 +418,6 @@ class HyperliquidClient:
             perp_dexs = ['km'] if self.config.trading.symbol.upper() == 'US500' else None
 
             self._info = Info(base_url=base_url, skip_ws=True, perp_dexs=perp_dexs)
-            
-            # Create a separate Info client for spot queries (without perp_dexs)
-            # This is needed because the km perp_dexs can cause slow spot_meta() calls
-            self._spot_info = Info(base_url=base_url, skip_ws=True) if perp_dexs else self._info
 
             # If the wallet address differs from the private key's address,
             # we're using an API wallet and need to specify account_address
@@ -916,9 +912,7 @@ class HyperliquidClient:
                 results.extend(await self.place_orders_batch(batch))
             return results
 
-        # Rate limit: bulk_orders counts as 1 API call regardless of orders in batch
-        # Hyperliquid allows up to 40 orders per bulk call
-        await self._rate_limiter.acquire(weight=1)
+        await self._rate_limiter.acquire(weight=len(requests))
         self._order_latency.start()
 
         try:
@@ -967,10 +961,9 @@ class HyperliquidClient:
             latency = self._order_latency.stop()
             logger.debug(f"Batch of {len(orders_data)} orders placed (latency: {latency:.1f}ms)")
             
-            # Debug: Log order count for HIP-3 (avoid logging full JSON to prevent loguru colorizer issues)
+            # Debug: Log full result for HIP-3 troubleshooting
             if requests and requests[0].symbol.upper() == "US500":
-                status_count = len(result.get("response", {}).get("data", {}).get("statuses", []))
-                logger.debug(f"HIP-3 order batch: {status_count} statuses returned")
+                logger.debug(f"HIP-3 order result: {result}")
 
             # Parse results
             orders = []
@@ -995,8 +988,7 @@ class HyperliquidClient:
                             oid = s["filled"].get("oid", "?")
                             logger.debug(f"  Order {i}: OID={oid} FILLED")
                         else:
-                            error_msg = str(s.get("error", str(s)))
-                            logger.debug(f"  Order {i}: FAILED - " + error_msg)
+                            logger.debug(f"  Order {i}: FAILED - {s}")
 
                 # Extract BBO from failed ALO orders and update internal orderbook
                 # Error format: "Post only order would have immediately matched, bbo was 90901@90902. asset=0"
@@ -1005,7 +997,7 @@ class HyperliquidClient:
                         error_msg = status.get("error", "")
                         if "bbo was" in error_msg:
                             # Log the ALO failure with bbo info
-                            logger.warning(f"Order {i} failed: {repr(status)}")
+                            logger.warning(f"Order {i} failed: {status}")
                             try:
                                 import re
 
@@ -1047,7 +1039,7 @@ class HyperliquidClient:
                             except Exception:
                                 pass  # Ignore parse errors
                         else:
-                            logger.warning(f"Order {i} failed: {repr(status)}")
+                            logger.warning(f"Order {i} failed: {status}")
 
                 for i, (req, status) in enumerate(zip(requests, statuses)):
                     if status.get("resting"):
@@ -1306,11 +1298,9 @@ class HyperliquidClient:
         try:
             from hyperliquid.utils.signing import CancelRequest
 
-            # Convert symbol to API format (km:US500 for HIP-3)
-            cancel_requests = []
-            for symbol, order_id in orders:
-                api_symbol = f"km:{symbol}" if symbol == "US500" else symbol
-                cancel_requests.append(CancelRequest(coin=api_symbol, oid=int(order_id)))
+            cancel_requests = [
+                CancelRequest(coin=symbol, oid=int(order_id)) for symbol, order_id in orders
+            ]
 
             result = self._exchange.bulk_cancel(cancel_requests)
 
@@ -1786,40 +1776,20 @@ class HyperliquidClient:
             perp_usdh_total = 0.0  # USDH deposited in perp for isolated margin
             if self.config.trading.symbol.upper() == "US500":
                 try:
-                    # Get Spot USDH balance - use _spot_info (without perp_dexs) for faster queries
-                    wallet = self.config.wallet_address
-                    spot_state = self._spot_info.spot_user_state(wallet)
-                    balances = spot_state.get("balances", [])
-                    
-                    # Find USDH in balances
-                    for b in balances:
+                    # Get Spot USDH balance
+                    spot_state = self._info.spot_user_state(self.config.wallet_address)
+                    for b in spot_state.get("balances", []):
                         if b.get("coin") == "USDH":
                             spot_usdh_total = float(b.get("total", 0))  # Total including held
                             spot_usdh_hold = float(b.get("hold", 0))   # Held by open orders
                             break
                     
-                    # Cache the last known good USDH balance
-                    if spot_usdh_total > 0:
-                        self._last_usdh_total = spot_usdh_total
-                        self._last_usdh_hold = spot_usdh_hold
-                        logger.info(f"💰 HIP-3 USDH: ${spot_usdh_total:.2f} (hold=${spot_usdh_hold:.2f})")
-                    elif hasattr(self, '_last_usdh_total') and self._last_usdh_total > 0:
-                        # API returned 0 but we have a cached value - use it
-                        spot_usdh_total = self._last_usdh_total
-                        spot_usdh_hold = self._last_usdh_hold
-                        logger.warning(f"USDH API returned $0, using cached: ${spot_usdh_total:.2f}")
-                    else:
-                        # Debug why we got 0 - check all balances
-                        usdh_found = [b for b in balances if 'USD' in b.get('coin', '')]
-                        logger.warning(f"HIP-3 USDH: $0 found. All USD-like balances: {repr(usdh_found)}")
+                    # For isolated margin positions, USDH used as margin is tracked separately
+                    # The position margin is part of the total USDH available for trading
+                    # Total USDH available = spot USDH + any USDH already in isolated positions
+                    logger.debug(f"HIP-3 USDH: spot=${spot_usdh_total:.2f}, hold=${spot_usdh_hold:.2f}")
                 except Exception as e:
-                    # Use cached value on error
-                    if hasattr(self, '_last_usdh_total') and self._last_usdh_total > 0:
-                        spot_usdh_total = self._last_usdh_total
-                        spot_usdh_hold = self._last_usdh_hold
-                        logger.warning(f"USDH API error, using cached ${spot_usdh_total:.2f}: {e}")
-                    else:
-                        logger.warning(f"Could not check Spot USDH: {e}")
+                    logger.debug(f"Could not check Spot USDH: {e}")
             
             # For US500 (km:US500): Use USDH as the trading balance
             # km:US500 uses ISOLATED margin with USDH collateral, NOT cross-margin USDC
@@ -1915,21 +1885,21 @@ class HyperliquidClient:
             # Query clearinghouse state for USDH margin info
             user_state = self._info.user_state(self.config.wallet.address)
             
-            if not user_state or "marginSummary" not in user_state:
-                logger.debug("No margin summary in user state")
+            if not user_state or \"marginSummary\" not in user_state:
+                logger.debug(\"No margin summary in user state\")
                 return None
             
-            margin = user_state["marginSummary"]
-            account_value = float(margin.get("accountValue", 0))
-            total_margin_used = float(margin.get("totalMarginUsed", 0))
-            total_ntl_pos = float(margin.get("totalNtlPos", 0))
-            withdrawable = float(margin.get("withdrawable", 0))
+            margin = user_state[\"marginSummary\"]
+            account_value = float(margin.get(\"accountValue\", 0))
+            total_margin_used = float(margin.get(\"totalMarginUsed\", 0))
+            total_ntl_pos = float(margin.get(\"totalNtlPos\", 0))
+            withdrawable = float(margin.get(\"withdrawable\", 0))
             
             # Calculate USDH margin ratio
             usdh_margin_ratio = total_margin_used / account_value if account_value > 0 else 0.0
             
             # Get maintenance margin
-            maintenance_margin = float(margin.get("totalRawUsd", 0)) * 0.03  # 3% maintenance
+            maintenance_margin = float(margin.get(\"totalRawUsd\", 0)) * 0.03  # 3% maintenance
             
             margin_state = USDHMarginState(
                 total_usdh_margin=total_margin_used,
@@ -1940,15 +1910,15 @@ class HyperliquidClient:
             )
             
             logger.debug(
-                f"USDH Margin: {usdh_margin_ratio:.1%} used, "
-                f"${available_usdh:,.2f} available, "
-                f"${account_value:,.2f} total"
+                f\"USDH Margin: {usdh_margin_ratio:.1%} used, \"
+                f\"${available_usdh:,.2f} available, \"
+                f\"${account_value:,.2f} total\"
             )
             
             return margin_state
             
         except Exception as e:
-            logger.error(f"Failed to get USDH margin state: {e}")
+            logger.error(f\"Failed to get USDH margin state: {e}\")
             return None
 
     @retry(

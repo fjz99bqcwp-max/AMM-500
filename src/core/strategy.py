@@ -323,14 +323,14 @@ class US500ProfessionalMM:
     MAKER_REBATE = 0.00003  # 0.003%
     TAKER_FEE = 0.00035  # 0.035%
     
-    # Professional MM parameters - MODIFIED FOR 200 ORDERS
+    # Professional MM parameters - OPTIMIZED FOR FAST STARTUP
     QUOTE_REFRESH_INTERVAL = 0.5  # 0.5s for HFT order placement
     MIN_ORDER_AGE_SECONDS = 30.0  # Keep orders longer - memorize until filled or replaced
-    MAX_LEVELS_PER_SIDE = 100  # 100 bids + 100 asks = 200 total
+    MAX_LEVELS_PER_SIDE = 100  # 100 bids + 100 asks = 200 total max
     MIN_BOOK_DEPTH_USD = 5000  # US500 threshold
     ADVERSE_SELECTION_THRESHOLD = 3  # Consecutive losing fills
     BOOK_MOVE_THRESHOLD = 0.005  # 0.5% book move triggers cancel/replace (less aggressive)
-    MAX_TOTAL_ORDERS = 200  # CRITICAL: Support 200 orders (100 bids + 100 asks)
+    MAX_TOTAL_ORDERS = 200  # 200 orders max (hard limit)
     ORDER_CLEANUP_INTERVAL = 60.0  # Cleanup every 60s
     MAX_NOTIONAL_PER_SIDE = 10000.0  # $10,000 max per side
     FIXED_RANGE_PCT = 0.02  # +/-2% fixed range
@@ -513,6 +513,9 @@ class US500ProfessionalMM:
             return
         
         try:
+            # Enforce order limits FIRST to prevent accumulation
+            await self._enforce_order_limits()
+            
             # Refresh inventory (every 5s to minimize API calls)
             now = time.time()
             if now - self._last_inventory_refresh > 5.0:
@@ -524,6 +527,22 @@ class US500ProfessionalMM:
             
             # Check if trading should be paused
             if risk_metrics.should_pause_trading:
+                logger.warning("Trading paused due to risk limits")
+                await self._cancel_all_quotes()
+                return
+
+            # Update quotes
+            await self._update_quotes(risk_metrics)
+            
+        except Exception as e:
+            logger.error(f"Error in iteration: {e}", exc_info=True)
+    
+    # =========================================================================
+    # ORDERBOOK ANALYSIS
+    # =========================================================================
+    
+    def _analyze_order_book(self, orderbook: OrderBook) -> BookDepthAnalysis:
+        """
         Professional-grade L2 order book analysis using institutional HFT metrics.
         
         Implements:
@@ -822,49 +841,7 @@ class US500ProfessionalMM:
             # Not enough liquidity
             return 0.0
         
-        return total_cost / target_sizeerbook.best_bid * best_ask_size + 
-                    orderbook.best_ask * best_bid_size
-                ) / total_size
-            else:
-                analysis.weighted_mid = orderbook.mid_price
-        else:
-            analysis.weighted_mid = orderbook.mid_price
-        
-        # Book pressure: imbalance weighted by depth
-        # Scale by total depth (normalized to $100k)
-        analysis.book_pressure = analysis.imbalance * min(total_depth / 100000, 1.0)
-        
-        # Queue position (estimate based on our active quotes)
-        if self.active_bids and orderbook.best_bid:
-            # Find our best bid
-            our_best_bid = max(q.price for q in self.active_bids.values())
-            if abs(our_best_bid - orderbook.best_bid) < 0.01:  # Within 1 tick
-                # We're at top - assume position 1
-                analysis.queue_position_bid = 1
-            else:
-                # Count levels ahead of us
-                analysis.queue_position_bid = sum(
-                    1 for price, size in orderbook.bids if price > our_best_bid
-                ) + 1
-        
-        if self.active_asks and orderbook.best_ask:
-            our_best_ask = min(q.price for q in self.active_asks.values())
-            if abs(our_best_ask - orderbook.best_ask) < 0.01:  # Within 1 tick
-                analysis.queue_position_ask = 1
-            else:
-                analysis.queue_position_ask = sum(
-                    1 for price, size in orderbook.asks if price < our_best_ask
-                ) + 1
-        
-        # Detailed logging for monitoring (debug level)
-        logger.debug(
-            f"L2 Analysis: Bid depth ${analysis.total_bid_depth:,.0f} (top5: ${analysis.top_5_bid_depth:,.0f}), "
-            f"Ask depth ${analysis.total_ask_depth:,.0f} (top5: ${analysis.top_5_ask_depth:,.0f}), "
-            f"Imbalance: {analysis.imbalance:+.3f}, Microprice: ${analysis.weighted_mid:.2f}, "
-            f"Pressure: {analysis.book_pressure:+.3f}, Liquid: {analysis.is_liquid}"
-        )
-        
-        return analysis
+        return total_cost / target_size
     
     # =========================================================================
     # DYNAMIC SPREAD CALCULATION
@@ -1033,8 +1010,64 @@ class US500ProfessionalMM:
         return min_spread, max_spread
     
     # =========================================================================
-    # INVENTORY SKEWING
+    # ORDERBOOK IMBALANCE & INVENTORY SKEWING
     # =========================================================================
+    
+    def _calculate_imbalance_skew(self) -> Tuple[float, float, float]:
+        """
+        Calculate quote skew based on ORDERBOOK IMBALANCE to capture spread.
+        
+        PROFESSIONAL MM STRATEGY:
+        - Positive imbalance (bid pressure) = price likely to rise
+          → Shift quotes UP, bid more aggressively, ask higher
+        - Negative imbalance (ask pressure) = price likely to fall
+          → Shift quotes DOWN, ask more aggressively, bid lower
+        
+        Returns (price_offset_bps, bid_size_mult, ask_size_mult):
+        - price_offset_bps: How many bps to shift quote center (+ve = up)
+        - bid_size_mult: Multiplier for bid sizes (>1 = larger bids)
+        - ask_size_mult: Multiplier for ask sizes (>1 = larger asks)
+        """
+        if not self.last_book_analysis:
+            return 0.0, 1.0, 1.0
+        
+        # Use liquidity-weighted imbalance (better signal than simple)
+        imb = self.last_book_analysis.liquidity_imbalance
+        
+        # PRICE OFFSET: Shift quote ladder toward imbalance direction
+        # At 30% imbalance → shift 2 bps, at 60% → shift 4 bps, etc.
+        # Max shift: 8 bps (to avoid over-skewing)
+        price_offset_bps = imb * 8.0  # -8 to +8 bps offset
+        price_offset_bps = max(-8.0, min(8.0, price_offset_bps))
+        
+        # SIZE ASYMMETRY: Increase size on passive side, decrease on aggressive
+        # Positive imbalance (bid pressure) = more ask size, less bid size
+        # Negative imbalance (ask pressure) = more bid size, less ask size
+        
+        # Passive side gets up to 50% more size, aggressive side up to 30% less
+        size_asymmetry = abs(imb) * 0.5  # 0 to 0.5
+        
+        if imb > 0.1:  # Bid pressure - sells are passive
+            bid_size_mult = 1.0 - size_asymmetry * 0.6  # Reduce bids (aggressive)
+            ask_size_mult = 1.0 + size_asymmetry  # Increase asks (passive)
+        elif imb < -0.1:  # Ask pressure - buys are passive  
+            bid_size_mult = 1.0 + size_asymmetry  # Increase bids (passive)
+            ask_size_mult = 1.0 - size_asymmetry * 0.6  # Reduce asks (aggressive)
+        else:
+            bid_size_mult = 1.0
+            ask_size_mult = 1.0
+        
+        # Bounds
+        bid_size_mult = max(0.5, min(1.5, bid_size_mult))
+        ask_size_mult = max(0.5, min(1.5, ask_size_mult))
+        
+        if abs(imb) > 0.15:
+            logger.info(
+                f"📊 Imbalance skew: {imb:+.3f} → offset={price_offset_bps:+.1f}bps, "
+                f"bid_mult={bid_size_mult:.2f}x, ask_mult={ask_size_mult:.2f}x"
+            )
+        
+        return price_offset_bps, bid_size_mult, ask_size_mult
     
     def _calculate_inventory_skew(self) -> Tuple[float, float]:
         """
@@ -1064,7 +1097,7 @@ class US500ProfessionalMM:
         return max(bid_skew, 0.5), max(ask_skew, 0.5)
     
     # =========================================================================
-    # EXPONENTIAL TIERED QUOTES
+    # EXPONENTIAL TIERED QUOTES WITH IMBALANCE SKEWING
     # =========================================================================
     
     def _build_tiered_quotes(
@@ -1075,14 +1108,14 @@ class US500ProfessionalMM:
         total_size: float
     ) -> Tuple[List[QuoteLevel], List[QuoteLevel]]:
         """
-        Build 100 levels per side with +/-2% range.
+        Build tiered quotes with IMBALANCE-BASED SKEWING to capture spread.
         
-        ULTRA-SMART SIZING WITH L2 ANALYSIS:
-        - Analyzes L2 book depth at each price level
-        - Larger sizes in liquid pockets (more book depth)
-        - Smaller sizes where thin (less book depth)
-        - Target: $10,000 notional per side
-        - Orders from closest (tightest spread) to furthest (+/-2%)
+        PROFESSIONAL MM APPROACH:
+        1. Use smart_price (microprice) instead of mid as quote center
+        2. Apply imbalance-based price offset (shift toward flow direction)
+        3. Asymmetric sizing (more on passive side)
+        4. Depth-aware sizing (larger in liquid pockets)
+        5. Target: $10,000 notional per side
         """
         if not orderbook.mid_price or not orderbook.best_bid or not orderbook.best_ask:
             logger.warning(f"Orderbook incomplete: mid={orderbook.mid_price}, bid={orderbook.best_bid}, ask={orderbook.best_ask}")
@@ -1092,10 +1125,30 @@ class US500ProfessionalMM:
         bids = []
         asks = []
         
-        # Fixed +/-2% range
+        # =====================================================================
+        # 1. USE SMART PRICE (MICROPRICE) AS QUOTE CENTER
+        # =====================================================================
+        # Smart price is more accurate than mid - it accounts for book imbalance
+        if self.last_book_analysis and self.last_book_analysis.smart_price > 0:
+            fair_value = self.last_book_analysis.smart_price
+            logger.debug(f"Using smart_price=${fair_value:.2f} (mid=${mid:.2f}, diff={((fair_value/mid)-1)*10000:.1f}bps)")
+        else:
+            fair_value = mid
+        
+        # =====================================================================
+        # 2. APPLY IMBALANCE-BASED PRICE OFFSET
+        # =====================================================================
+        price_offset_bps, bid_size_mult, ask_size_mult = self._calculate_imbalance_skew()
+        
+        # Shift fair value by imbalance offset
+        quote_center = fair_value * (1 + price_offset_bps / 10000)
+        
+        # =====================================================================
+        # 3. CALCULATE QUOTE RANGES FROM SHIFTED CENTER
+        # =====================================================================
         range_pct = self.FIXED_RANGE_PCT
-        bid_start = mid * (1 - range_pct)  # -2%
-        ask_end = mid * (1 + range_pct)    # +2%
+        bid_start = quote_center * (1 - range_pct)  # -2% from center
+        ask_end = quote_center * (1 + range_pct)    # +2% from center
         
         # Number of levels per side
         total_levels = self.MAX_LEVELS_PER_SIDE
@@ -1113,15 +1166,18 @@ class US500ProfessionalMM:
         bid_sizes = []
         ask_sizes = []
         
-        # Target: $10k notional per side
-        target_notional = self.MAX_NOTIONAL_PER_SIDE
+        # Target notional based on risk-adjusted total_size
+        # total_size is in contracts, convert to notional USD
+        # Apply imbalance-based size multipliers
+        target_bid_notional = min(total_size * mid * bid_size_mult, self.MAX_NOTIONAL_PER_SIDE)
+        target_ask_notional = min(total_size * mid * ask_size_mult, self.MAX_NOTIONAL_PER_SIDE)
         
-        # Build bids from CLOSEST to FURTHEST (mid to mid-2%)
+        # Build bids from CLOSEST to FURTHEST (quote_center to quote_center-2%)
         for i in range(total_levels):
             t = i / (total_levels - 1) if total_levels > 1 else 0
-            bid_price = round_price(mid - (mid - bid_start) * t, tick_size)
+            bid_price = round_price(quote_center - (quote_center - bid_start) * t, tick_size)
             
-            if bid_price > 0 and bid_price < mid:
+            if bid_price > 0 and bid_price < quote_center:
                 # Smart sizing: check local book depth
                 local_depth = bid_depth_map.get(bid_price, 0)
                 
@@ -1140,9 +1196,9 @@ class US500ProfessionalMM:
         # Build asks from CLOSEST to FURTHEST (mid to mid+2%)
         for i in range(total_levels):
             t = i / (total_levels - 1) if total_levels > 1 else 0
-            ask_price = round_price(mid + (ask_end - mid) * t, tick_size)
+            ask_price = round_price(quote_center + (ask_end - quote_center) * t, tick_size)
             
-            if ask_price > mid:
+            if ask_price > quote_center:
                 # Smart sizing: check local book depth
                 local_depth = ask_depth_map.get(ask_price, 0)
                 
@@ -1156,24 +1212,24 @@ class US500ProfessionalMM:
                 
                 ask_sizes.append(depth_factor)
         
-        # Normalize sizes to hit target notional
+        # Normalize sizes to hit target notional (asymmetric based on imbalance)
         total_bid_weight = sum(bid_sizes)
         total_ask_weight = sum(ask_sizes)
         
-        avg_bid_price = (bid_start + mid) / 2
-        avg_ask_price = (mid + ask_end) / 2
+        avg_bid_price = (bid_start + quote_center) / 2
+        avg_ask_price = (quote_center + ask_end) / 2
         
-        # Scale to target notional
-        bid_notional_per_unit = target_notional / (total_bid_weight * avg_bid_price) if total_bid_weight > 0 else 0
-        ask_notional_per_unit = target_notional / (total_ask_weight * avg_ask_price) if total_ask_weight > 0 else 0
+        # Scale to target notional (asymmetric for bid/ask based on imbalance)
+        bid_notional_per_unit = target_bid_notional / (total_bid_weight * avg_bid_price) if total_bid_weight > 0 else 0
+        ask_notional_per_unit = target_ask_notional / (total_ask_weight * avg_ask_price) if total_ask_weight > 0 else 0
         
-        # Build final bid orders with smart sizes
+        # Build final bid orders with smart sizes (quote_center anchored)
         bid_idx = 0
         for i in range(total_levels):
             t = i / (total_levels - 1) if total_levels > 1 else 0
-            bid_price = round_price(mid - (mid - bid_start) * t, tick_size)
+            bid_price = round_price(quote_center - (quote_center - bid_start) * t, tick_size)
             
-            if bid_price > 0 and bid_price < mid and bid_idx < len(bid_sizes):
+            if bid_price > 0 and bid_price < quote_center and bid_idx < len(bid_sizes):
                 size = max(round_size(bid_sizes[bid_idx] * bid_notional_per_unit, lot_size), lot_size)
                 bids.append(QuoteLevel(
                     price=bid_price,
@@ -1184,12 +1240,13 @@ class US500ProfessionalMM:
                 bid_idx += 1
         
         # Build final ask orders with smart sizes
+        # Build final ask orders with smart sizes (quote_center anchored)
         ask_idx = 0
         for i in range(total_levels):
             t = i / (total_levels - 1) if total_levels > 1 else 0
-            ask_price = round_price(mid + (ask_end - mid) * t, tick_size)
+            ask_price = round_price(quote_center + (ask_end - quote_center) * t, tick_size)
             
-            if ask_price > mid and ask_idx < len(ask_sizes):
+            if ask_price > quote_center and ask_idx < len(ask_sizes):
                 size = max(round_size(ask_sizes[ask_idx] * ask_notional_per_unit, lot_size), lot_size)
                 asks.append(QuoteLevel(
                     price=ask_price,
@@ -1199,11 +1256,18 @@ class US500ProfessionalMM:
                 ))
                 ask_idx += 1
         
-        # Log first and last levels with sizes
-        if bids:
-            logger.debug(f"Built {len(bids)} smart-sized bids: {bids[0].price:.2f} (size={bids[0].size:.2f}) to {bids[-1].price:.2f} (size={bids[-1].size:.2f})")
-        if asks:
-            logger.debug(f"Built {len(asks)} smart-sized asks: {asks[0].price:.2f} (size={asks[0].size:.2f}) to {asks[-1].price:.2f} (size={asks[-1].size:.2f})")
+        # Log quote summary with imbalance skew info
+        if bids and asks:
+            logger.info(
+                f"📊 Built {len(bids)} bids + {len(asks)} asks | "
+                f"center=${quote_center:.2f} (offset={price_offset_bps:+.1f}bps) | "
+                f"bid_mult={bid_size_mult:.2f}x ask_mult={ask_size_mult:.2f}x | "
+                f"range: ${bids[-1].price:.2f} - ${asks[-1].price:.2f}"
+            )
+        elif bids:
+            logger.debug(f"Built {len(bids)} bids only: ${bids[0].price:.2f} to ${bids[-1].price:.2f}")
+        elif asks:
+            logger.debug(f"Built {len(asks)} asks only: ${asks[0].price:.2f} to ${asks[-1].price:.2f}")
         
         return bids, asks
     
@@ -1221,8 +1285,8 @@ class US500ProfessionalMM:
         3. Check book liquidity
         4. Build exponentially tiered quotes
         5. Apply inventory skew
-        6. Handle one-sided quoting (extreme imbalance >2.5%)
-        7. Smart cancel/replace on book moves >0.1%
+        6. Handle one-sided quoting (extreme imbalance >5%)
+        7. Query exchange for current orders, cancel stale, place new
         """
         # Check interval (0.5s for HFT)
         now = time.time()
@@ -1294,8 +1358,8 @@ class US500ProfessionalMM:
                 await self._cancel_all_side("sell")
                 logger.warning(f"ONE-SIDED bids: delta={self.inventory.delta:.3f} <-5%")
         
-        # Update orders
-        await self._update_orders(new_bids, new_asks)
+        # Update orders using batch placement for efficiency
+        await self._update_orders_batch(new_bids, new_asks)
     
     async def _update_orders(
         self, 
@@ -1418,6 +1482,329 @@ class US500ProfessionalMM:
             await place_batch(batch)
             logger.debug(f"Batch {batch_idx+1}/{len(batches)} placed ({len(batch)} orders)")
     
+    async def _update_orders_batch(
+        self, 
+        new_bids: List[QuoteLevel], 
+        new_asks: List[QuoteLevel]
+    ) -> None:
+        """
+        SMART Orderbook-Aware Batch Order Update.
+        
+        Uses orderbook analysis to:
+        1. Find optimal insertion points (gaps, small queues)
+        2. Prioritize best price levels for immediate placement
+        3. Use tolerance-based matching to reduce unnecessary cancels
+        4. Track queue position for better fill probability
+        
+        CRITICAL: For HIP-3 (US500), open_orders() returns empty!
+        Must use historicalOrders API with status='open' filtering.
+        """
+        import requests
+        from collections import defaultdict
+        
+        now = time.time()
+        tick_size = 0.01  # US500 tick
+        
+        # =====================================================================
+        # STEP 1: Get actual open orders from exchange
+        # =====================================================================
+        try:
+            wallet_address = self.client.config.wallet_address
+            api_symbol = "km:US500"
+            
+            resp = requests.post("https://api.hyperliquid.xyz/info", json={
+                "type": "historicalOrders",
+                "user": wallet_address
+            }, timeout=10)
+            historical = resp.json()
+            
+            # Group by OID - historicalOrders returns multiple records per order
+            by_oid = defaultdict(list)
+            for o in historical:
+                if o.get("order", {}).get("coin") == api_symbol:
+                    oid = o.get("order", {}).get("oid")
+                    by_oid[oid].append(o)
+            
+            # Find orders where LATEST status is 'open'
+            exchange_orders = []  # (oid, price, size, side, timestamp)
+            for oid, records in by_oid.items():
+                records.sort(key=lambda x: x.get("statusTimestamp", 0), reverse=True)
+                latest = records[0]
+                if latest.get("status") == "open":
+                    order_info = latest.get("order", {})
+                    price = float(order_info.get("limitPx", 0))
+                    size = float(order_info.get("sz", 0))
+                    side = order_info.get("side", "").upper()  # "B" or "A"
+                    ts = latest.get("statusTimestamp", 0)
+                    exchange_orders.append((str(oid), price, size, side, ts))
+            
+            logger.debug(f"[SMART] Found {len(exchange_orders)} open US500 orders on exchange")
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch exchange orders: {e}")
+            exchange_orders = []
+        
+        # =====================================================================
+        # STEP 2: Get orderbook for smart analysis
+        # =====================================================================
+        orderbook = self.last_orderbook
+        mid_price = orderbook.mid_price if orderbook else 0
+        
+        # Build orderbook depth maps for smart placement
+        bid_depth = {}  # price -> total_size at that level
+        ask_depth = {}
+        if orderbook:
+            for price, size in orderbook.bids[:50]:  # Top 50 levels
+                bid_depth[round(price, 2)] = size
+            for price, size in orderbook.asks[:50]:
+                ask_depth[round(price, 2)] = size
+        
+        # =====================================================================
+        # STEP 3: Score and prioritize new quotes
+        # Higher score = better level (should place first)
+        # =====================================================================
+        def score_quote(quote: QuoteLevel, is_bid: bool) -> float:
+            """
+            Score a quote level based on:
+            - Proximity to mid (closer = higher score)
+            - Local liquidity (thin areas = higher score for better fills)
+            - Gap opportunities (placing in gaps = higher score)
+            """
+            if not mid_price:
+                return 0
+            
+            score = 100.0
+            price = round(quote.price, 2)
+            
+            # Proximity score: closer to mid = better (0-50 points)
+            distance_bps = abs(price - mid_price) / mid_price * 10000
+            proximity_score = max(0, 50 - distance_bps)  # 50 points at mid, 0 at 50bps away
+            score += proximity_score
+            
+            # Liquidity score: thinner areas = better fill chance (0-30 points)
+            depth_map = bid_depth if is_bid else ask_depth
+            local_depth = depth_map.get(price, 0)
+            if local_depth < 0.5:
+                score += 30  # Very thin - great opportunity
+            elif local_depth < 1.0:
+                score += 20  # Thin
+            elif local_depth < 2.0:
+                score += 10  # Moderate
+            # Thick areas get 0 bonus
+            
+            # Gap detection: check if there's a gap around this price (0-20 points)
+            # Find nearest existing levels
+            prices_in_book = sorted(depth_map.keys())
+            if prices_in_book:
+                # Find gap before and after this price
+                below = [p for p in prices_in_book if p < price]
+                above = [p for p in prices_in_book if p > price]
+                
+                gap_before = (price - below[-1]) / tick_size if below else 0
+                gap_after = (above[0] - price) / tick_size if above else 0
+                
+                # Reward placing in larger gaps
+                if gap_before > 3 or gap_after > 3:
+                    score += 20  # Large gap opportunity
+                elif gap_before > 2 or gap_after > 2:
+                    score += 10
+            
+            return score
+        
+        # Score all new quotes
+        scored_bids = [(score_quote(b, True), b) for b in new_bids]
+        scored_asks = [(score_quote(a, False), a) for a in new_asks]
+        
+        # Sort by score (highest first)
+        scored_bids.sort(key=lambda x: -x[0])
+        scored_asks.sort(key=lambda x: -x[0])
+        
+        # =====================================================================
+        # STEP 4: Smart tolerance-based matching
+        # Match existing orders within tolerance to reduce cancellations
+        # =====================================================================
+        PRICE_TOLERANCE_BPS = 1.0  # 1 bps tolerance = don't cancel if within 1bp
+        
+        # Build lookup for new prices with tolerance
+        new_bid_prices = {}  # rounded_price -> QuoteLevel
+        for _, bid in scored_bids:
+            new_bid_prices[round(bid.price, 2)] = bid
+            
+        new_ask_prices = {}
+        for _, ask in scored_asks:
+            new_ask_prices[round(ask.price, 2)] = ask
+        
+        # Match exchange orders to new quotes with tolerance
+        to_cancel = []
+        matched_bid_prices = set()
+        matched_ask_prices = set()
+        kept_orders = []  # Orders we're keeping
+        
+        for oid, price, size, side, ts in exchange_orders:
+            rounded_price = round(price, 2)
+            matched = False
+            
+            if side == "B":  # Bid
+                # Try exact match first
+                if rounded_price in new_bid_prices:
+                    matched = True
+                    matched_bid_prices.add(rounded_price)
+                else:
+                    # Try tolerance match (within 1bp)
+                    for new_price in new_bid_prices:
+                        if abs(new_price - rounded_price) <= mid_price * PRICE_TOLERANCE_BPS / 10000:
+                            matched = True
+                            matched_bid_prices.add(new_price)
+                            break
+            else:  # Ask
+                if rounded_price in new_ask_prices:
+                    matched = True
+                    matched_ask_prices.add(rounded_price)
+                else:
+                    for new_price in new_ask_prices:
+                        if abs(new_price - rounded_price) <= mid_price * PRICE_TOLERANCE_BPS / 10000:
+                            matched = True
+                            matched_ask_prices.add(new_price)
+                            break
+            
+            if matched:
+                kept_orders.append((oid, price, size, side))
+            else:
+                to_cancel.append(oid)
+        
+        # =====================================================================
+        # STEP 5: Intelligent cancellation with batch limits
+        # =====================================================================
+        # Don't cancel too many at once - risk of being naked
+        MAX_CANCEL_PER_CYCLE = 50  # Cancel at most 50 per cycle
+        
+        if len(to_cancel) > MAX_CANCEL_PER_CYCLE:
+            # Prioritize cancelling furthest-from-mid orders
+            cancel_with_price = [(oid, p, s) for oid, p, _, s, _ in exchange_orders if oid in to_cancel]
+            cancel_with_price.sort(key=lambda x: -abs(x[1] - mid_price))  # Furthest first
+            to_cancel = [x[0] for x in cancel_with_price[:MAX_CANCEL_PER_CYCLE]]
+            logger.debug(f"[SMART] Limiting cancels to {MAX_CANCEL_PER_CYCLE} (furthest from mid first)")
+        
+        if to_cancel:
+            logger.info(f"[SMART] Cancelling {len(to_cancel)} orders (keeping {len(kept_orders)})")
+            await self._batch_cancel(to_cancel)
+        
+        # =====================================================================
+        # STEP 6: Build BALANCED order list (interleave bids and asks)
+        # =====================================================================
+        # Collect unmatched bids and asks separately
+        unmatched_bids: List[QuoteLevel] = []
+        for score, bid in scored_bids:
+            if round(bid.price, 2) not in matched_bid_prices:
+                unmatched_bids.append(bid)
+        
+        unmatched_asks: List[QuoteLevel] = []
+        for score, ask in scored_asks:
+            if round(ask.price, 2) not in matched_ask_prices:
+                unmatched_asks.append(ask)
+        
+        # =====================================================================
+        # STEP 7: Balanced allocation - ensure both sides get orders
+        # =====================================================================
+        MAX_NEW_ORDERS_PER_CYCLE = 80  # Place at most 80 new orders per cycle
+        MAX_PER_SIDE = MAX_NEW_ORDERS_PER_CYCLE // 2  # 40 per side max
+        
+        # Take top N from each side (already sorted by score)
+        selected_bids = unmatched_bids[:MAX_PER_SIDE]
+        selected_asks = unmatched_asks[:MAX_PER_SIDE]
+        
+        # Interleave for balanced placement: bid, ask, bid, ask...
+        orders_to_place: List[QuoteLevel] = []
+        max_len = max(len(selected_bids), len(selected_asks))
+        for i in range(max_len):
+            if i < len(selected_bids):
+                orders_to_place.append(selected_bids[i])
+            if i < len(selected_asks):
+                orders_to_place.append(selected_asks[i])
+        
+        new_bids_count = len(selected_bids)
+        new_asks_count = len(selected_asks)
+        
+        logger.debug(f"[SMART] Placing {new_bids_count} bids + {new_asks_count} asks (matched {len(matched_bid_prices)}b/{len(matched_ask_prices)}a)")
+
+        
+        if not orders_to_place:
+            # Update local tracking from kept orders
+            self.active_bids.clear()
+            self.active_asks.clear()
+            for oid, price, size, side in kept_orders:
+                level = QuoteLevel(
+                    price=price,
+                    size=size,
+                    side=OrderSide.BUY if side == "B" else OrderSide.SELL
+                )
+                level.order_id = oid
+                if side == "B":
+                    self.active_bids[oid] = level
+                else:
+                    self.active_asks[oid] = level
+            return
+        
+        # =====================================================================
+        # STEP 8: Place orders with reduce-only logic
+        # =====================================================================
+        reduce_only = await self._should_use_reduce_only()
+        
+        order_requests = []
+        quotes_for_requests = []
+        
+        for quote in orders_to_place:
+            is_reducing = (
+                (quote.side == OrderSide.SELL and self.inventory.position_size > 0) or
+                (quote.side == OrderSide.BUY and self.inventory.position_size < 0)
+            )
+            
+            if reduce_only and not is_reducing:
+                continue
+            
+            order_requests.append(OrderRequest(
+                symbol=self.symbol,
+                side=quote.side,
+                order_type=OrderType.LIMIT,
+                size=quote.size,
+                price=quote.price,
+                time_in_force=TimeInForce.GTC,
+                reduce_only=reduce_only
+            ))
+            quotes_for_requests.append(quote)
+        
+        if not order_requests:
+            return
+        
+        # Place orders in batch
+        try:
+            results = await self.client.place_orders_batch(order_requests)
+            
+            placed_bids = 0
+            placed_asks = 0
+            
+            for i, order in enumerate(results):
+                if order and order.order_id:
+                    quote = quotes_for_requests[i]
+                    quote.order_id = order.order_id
+                    quote.created_at = time.time()
+                    
+                    if quote.side == OrderSide.BUY:
+                        self.active_bids[order.order_id] = quote
+                        placed_bids += 1
+                    else:
+                        self.active_asks[order.order_id] = quote
+                        placed_asks += 1
+                    
+                    self._order_memory[order.order_id] = quote
+                    self.metrics.quotes_sent += 1
+            
+            if placed_bids > 0 or placed_asks > 0:
+                logger.info(f"[SMART] Batch placed {placed_bids} bids + {placed_asks} asks")
+                
+        except Exception as e:
+            logger.error(f"[SMART] Batch order placement failed: {e}", exc_info=True)
+
     def _find_optimal_quote_levels(self, orderbook: OrderBook, side: str, num_levels: int, base_mid: float) -> List[float]:
         """    
         Analyze orderbook to find optimal quote insertion points.
@@ -1692,18 +2079,26 @@ class US500ProfessionalMM:
             self.metrics.net_pnl = realized_pnl
     
     async def _sync_recent_fills(self) -> None:
-        """Sync recent fills for adverse selection detection."""
+        """Sync recent fills for adverse selection detection and fill-based equity tracking."""
         try:
-            # Get last 20 fills from trade tracker
-            fills = self.trade_tracker.data.get("fills", [])[-20:]
+            # Get ALL fills from exchange for accurate fill-based tracking
+            fills = self.client._info.user_fills(self.client.config.wallet_address)
             
-            for fill in fills:
+            # Filter for US500/km:US500 fills
+            us500_fills = [f for f in fills if 'US500' in f.get('coin', '') or f.get('coin') == 'km:US500']
+            
+            # Sync fill-based equity tracking in risk manager
+            # This calculates equity from: collateral + sum(closedPnl) - sum(fees)
+            self.risk_manager.sync_fills_from_exchange(us500_fills)
+            
+            # Also sync metrics for adverse selection
+            for fill in us500_fills[-20:]:  # Last 20 for metrics
                 side = OrderSide.BUY if fill.get("side") == "B" else OrderSide.SELL
                 price = float(fill.get("px", 0))
                 size = float(fill.get("sz", 0))
                 self.metrics.add_fill(side, price, size)
             
-            logger.info(f"Synced {len(fills)} recent fills")
+            logger.info(f"Synced {len(us500_fills)} recent fills")
         
         except Exception as e:
             logger.error(f"Failed to sync fills: {e}")
@@ -1711,33 +2106,56 @@ class US500ProfessionalMM:
     async def _enforce_order_limits(self) -> None:
         """Enforce max order limits to prevent accumulation."""
         try:
-            total_active = len(self.active_bids) + len(self.active_asks)
+            # CRITICAL: For HIP-3 perps (km:US500), open_orders() returns EMPTY!
+            # Must use historicalOrders with status='open' filtering instead
+            wallet_address = self.client.config.wallet_address
             
-            if total_active > self.MAX_TOTAL_ORDERS:
+            # Get historical orders and filter for open status
+            historical_orders = self.client._info.historical_orders(wallet_address)
+            
+            # Count US500/km:US500 orders that are still open
+            us500_count = 0
+            for o in historical_orders:
+                coin = o.get("coin", "") if isinstance(o, dict) else getattr(o, "coin", "")
+                status = o.get("status", "") if isinstance(o, dict) else getattr(o, "status", "")
+                if ("US500" in coin or coin == "km:US500") and status == "open":
+                    us500_count += 1
+            
+            if us500_count > self.MAX_TOTAL_ORDERS:
                 logger.warning(
-                    f"⚠️ Order limit exceeded: {total_active}/{self.MAX_TOTAL_ORDERS} - "
+                    f"⚠️ Order limit exceeded: {us500_count}/{self.MAX_TOTAL_ORDERS} on exchange - "
                     "cancelling all orders"
                 )
                 await self._cancel_all_quotes()
                 self.active_bids.clear()
                 self.active_asks.clear()
-                
-                # Force re-sync from exchange
-                await self._sync_active_orders()
+            elif us500_count > 0:
+                logger.debug(f"Order count check: {us500_count}/{self.MAX_TOTAL_ORDERS} on exchange")
         
         except Exception as e:
             logger.error(f"Order limit enforcement failed: {e}")
     
     async def _sync_active_orders(self) -> None:
-        """Sync active orders with exchange (US500 uses historicalOrders)."""
+        """Sync active orders with exchange (US500 uses km prefix)."""
         try:
-            # US500 uses Info API to fetch open orders
+            # CRITICAL: For HIP-3 perps (km:US500), open_orders() returns EMPTY!
+            # Must use historicalOrders with status='open' filtering instead
             wallet_address = self.client.config.wallet_address
-            orders = self.client._info.open_orders(wallet_address)
+            historical_orders = self.client._info.historical_orders(wallet_address)
             
-            # Remove local orders not on exchange
-            exchange_oids = {o.order_id for o in orders if o.order_id}
+            # Filter for US500 (km:US500) orders that are still open
+            us500_orders = []
+            for o in historical_orders:
+                coin = o.get("coin", "") if isinstance(o, dict) else getattr(o, "coin", "")
+                status = o.get("status", "") if isinstance(o, dict) else getattr(o, "status", "")
+                if ("US500" in coin or coin == "km:US500") and status == "open":
+                    oid = o.get("oid", 0) if isinstance(o, dict) else getattr(o, "oid", 0)
+                    us500_orders.append(str(oid))
             
+            exchange_oids = set(us500_orders)
+            
+            # Update local tracking to match exchange
+            # Remove orders that are no longer on exchange
             for oid in list(self.active_bids.keys()):
                 if oid not in exchange_oids:
                     del self.active_bids[oid]
@@ -1746,7 +2164,14 @@ class US500ProfessionalMM:
                 if oid not in exchange_oids:
                     del self.active_asks[oid]
             
-            logger.debug(f"Synced orders: {len(exchange_oids)} on exchange")
+            # Add any exchange orders we don't have locally
+            local_oids = set(self.active_bids.keys()) | set(self.active_asks.keys())
+            exchange_only = len(exchange_oids - local_oids)
+            
+            if exchange_only > 0:
+                logger.debug(f"Found {exchange_only} orders on exchange not in local tracking")
+            
+            logger.debug(f"Synced: {len(exchange_oids)} on exchange, {len(self.active_bids)} bids + {len(self.active_asks)} asks local")
         
         except Exception as e:
             logger.error(f"Order sync failed: {e}")
@@ -1807,6 +2232,10 @@ class US500ProfessionalMM:
             
             self.metrics.fees_paid += abs(fee)
             self.metrics.gross_pnl += closed_pnl
+            
+            # Update fill-based equity tracking in risk manager
+            # This bypasses the broken balance API for HIP-3
+            self.risk_manager.update_from_fill(closed_pnl, abs(fee))
             
             # Remove from active
             if oid in self.active_bids:

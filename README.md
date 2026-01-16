@@ -9,20 +9,23 @@ A high-frequency trading bot optimized for US500-USDH perpetuals on Hyperliquid 
 ## 🎯 Features
 
 ### Core Market Making
+- **Smart Orderbook Placement**: Analyzes L2 depth to find liquidity gaps (>2 ticks) and join small queues (<1.0), smarter than random grid placement
+- **Reduce-Only Mode**: 4 automatic triggers (USDH margin >80%, inventory skew >1.5%, consecutive losses >10, drawdown >2%) for intelligent position unwinding
 - **Ultra-Smart Order Sizing**: Dynamic order sizes based on L2 book depth (larger in liquid pockets, smaller where thin)
 - **Position Skewing with USDH Feedback**: Reduces size by 20% when margin >80%, aggressive rebalancing
-- **L2 Order Book Integration**: Real-time WebSocket subscriptions with sub-50ms latency
+- **L2 Order Book Integration**: Real-time WebSocket subscriptions with sub-50ms latency, 15+ institutional metrics
 - **Dynamic Exponential Tiering**: 1-50 bps spread, volatility-adaptive (70% liquidity in top 5 levels)
-- **PyTorch Vol Predictor**: LSTM-based forecasting trained on xyz100/BTC for spread widening
+- **PyTorch Vol Predictor**: LSTM-based forecasting enabled by default, trained on xyz100/BTC for spread widening
 
 ### Data & Execution
-- **xyz100 (^OEX) Primary**: S&P100 via yfinance (0.98 correlation with S&P500)
-- **BTC Fallback**: Hyperliquid SDK when xyz100 insufficient
-- **0.5s Rebalance**: M4-optimized async execution (10 cores)
+- **xyz100 (^OEX) Primary**: S&P 100 via yfinance (0.98 correlation with S&P 500), superior to BTC proxy (0.7 correlation)
+- **BTC Fallback**: Hyperliquid SDK when xyz100 insufficient, automatic fallback chain (xyz100 → US500 → BTC)
+- **0.5s Rebalance**: M4-optimized async execution (10 cores), parallel order placement
 - **Maker-Only Focus**: Taker cap <5% enforced in risk management
 
 ### Risk & Monitoring
-- **USDH Margin System**: 90% cap with liquidation protection (HIP-3)
+- **USDH Margin System**: HIP-3 native support, 90% cap with liquidation protection, real-time margin monitoring
+- **Automatic Reduce-Only**: Triggers on high margin/skew/losses/drawdown to prevent over-leveraging
 - **24/7 Autonomous Monitoring**: Auto-restart, email/Slack alerts, kill switches
 - **Real-time Metrics**: Sharpe, ROI, drawdown, maker ratio, fill rate
 
@@ -53,15 +56,19 @@ WALLET_ADDRESS=0x1cCC14E273DEF02EF2BF62B9bb6B6cAa15805f9C
 
 ### 3. Fetch Historical Data
 ```bash
-# Primary: xyz100 (S&P100) via yfinance
-python amm-500.py --fetch-xyz100 --days 30
+# Fetch data (xyz100 PRIMARY → US500 → BTC fallback chain)
+python amm-500.py --fetch-data --fetch-days 30
 
-# Fallback: BTC via Hyperliquid SDK  
-python amm-500.py --fetch-data --days 30
+# Verify data quality
+ls -lh data/*.csv
 ```
 
 ### 4. Run Backtest
 ```bash
+# Note: If you encounter syntax errors, run:
+# python -m py_compile src/core/*.py
+# VS Code's linter may not catch all runtime issues
+
 python amm-500.py --backtest --days 30
 ```
 
@@ -88,7 +95,38 @@ python scripts/automation/amm_autonomous.py
 
 ### 8. Go Live (After Successful Paper Trading)
 ```bash
+# Standard mode
 python amm-500.py
+
+# Force reduce-only mode (emergencies)
+python amm-500.py --reduce-only
+```
+
+### 9. Emergency Stop & Position Close
+```bash
+# Kill bot and cancel all orders (keeps positions open)
+pkill -9 -f "amm-500.py"
+python scripts/cancel_orders.py
+
+# Kill bot AND close all positions (emergency exit)
+pkill -9 -f "amm-500.py"
+python amm-500.py --emergency-close
+
+# Full cleanup: kill all Python, free ports, cancel orders
+pkill -9 python; lsof -ti:9090 | xargs kill -9 2>/dev/null
+python scripts/cancel_orders.py --all
+```
+
+**Additional Commands:**
+```bash
+# Check bot status
+python amm-500.py --status
+
+# Fetch xyz100 data
+python amm-500.py --fetch-xyz100 --days 30
+
+# Run backtest
+python amm-500.py --backtest --months 3
 ```
 
 ---
@@ -170,6 +208,24 @@ INVENTORY_SKEW_THRESHOLD=0.005      # 0.5% triggers skewing
 USDH_MARGIN_WARNING=0.80            # 80% USDH margin warning
 USDH_MARGIN_CAP=0.90                # 90% USDH margin hard cap
 
+# Smart Placement & Reduce-Only
+ENABLE_SMART_PLACEMENT=true         # Analyze L2 for optimal insertion
+MIN_QUEUE_SIZE=0.5                  # Join queues <0.5 lot
+MAX_SPREAD_CROSS=5                  # Don't cross >5 ticks
+AUTO_REDUCE_ONLY=true               # Enable automatic reduce-only
+REDUCE_ONLY_MARGIN=0.80             # Trigger at 80% USDH
+REDUCE_ONLY_SKEW=0.015              # Trigger at 1.5% delta
+
+# Data Sources
+USE_XYZ100_PRIMARY=true             # ^OEX via yfinance (PRIMARY)
+XYZ100_MIN_BARS=1000                # Min bars for xyz100 use
+BTC_FALLBACK_ENABLED=true           # Enable BTC proxy
+
+# Machine Learning & Performance
+ML_VOLATILITY_PREDICT=true          # PyTorch vol predictor (default)
+M4_PARALLEL_ORDERS=true             # 10-core optimization
+M4_BATCH_SIZE=10                    # Batch size for parallel
+
 # Alerts
 SMTP_USER=your-email@gmail.com
 ALERT_EMAIL=alerts@example.com
@@ -204,6 +260,24 @@ LEVERAGE=25 python amm-500.py --backtest --months 12
 | Max Drawdown | **<0.5%** | Capital preservation |
 | Trades/Day | **>2000** | HFT frequency |
 | Maker Ratio | **>90%** | Fee optimization |
+| Reduce-Only Efficiency | **10-20%** | Position management |
+| Smart Fill Rate | **>15%** | Orderbook advantage |
+
+**Analysis Commands:**
+```bash
+# Real-time monitoring
+tail -f logs/bot_$(date +%Y-%m-%d).log | grep -E "(FILL|L2 Analysis|reduce-only)"
+
+# Post-analysis (after 7 days)
+python scripts/analysis/analyze_paper_results.py --days 7 --metrics all
+
+# Expected Results:
+# - PnL: $50-75 (5-7.5% on $1000)
+# - Fills: 14000-20000 (2000-2800/day)
+# - Maker fills: 12600-18000 (>90%)
+# - Reduce-only fills: 1400-4000 (10-20%)
+# - Smart placements: 2100-4000 (15-20% queue advantage)
+```
 
 ### Phase 3: Live Deployment (Low Capital)
 - Start with $100-500 USDH
@@ -212,10 +286,12 @@ LEVERAGE=25 python amm-500.py --backtest --months 12
 
 ### 🚨 Red Flags (Auto-Kill Triggers)
 - Max DD >5% → Emergency stop
-- 10 consecutive losses → Pause trading
+- 10 consecutive losses → Pause trading (auto-reduce-only)
 - Session loss >$100 → Alert + stop
+- USDH margin >80% → Reduce-only mode activated
 - USDH margin >90% → Reduce position immediately
 - Taker ratio >10% → Widen spreads
+- Inventory skew >1.5% → Reduce-only triggered
 
 ---
 
@@ -225,7 +301,23 @@ LEVERAGE=25 python amm-500.py --backtest --months 12
 - Check `logs/bot_$(date +%Y-%m-%d).log` for errors
 - Verify `config/.env` has valid PRIVATE_KEY
 - Ensure USDH margin <90%
+- Check if reduce-only mode is active (will only close positions)
 - Check network connection to Hyperliquid
+
+### Orders Being Cancelled (Reduce-Only Mode)
+- Bot automatically enters reduce-only mode when:
+  * USDH margin >80% (approaching limit)
+  * Inventory skew >1.5% (need to rebalance)
+  * 10+ consecutive losses (risk management)
+  * Daily drawdown >2% (defensive mode)
+- To override: Set `AUTO_REDUCE_ONLY=false` in config/.env
+- To force: Use `python amm-500.py --reduce-only`
+
+### Orderbook Analysis Not Working
+- Verify ENABLE_SMART_PLACEMENT=true in config/.env
+- Check L2 orderbook data available in logs
+- If gaps not found, bot falls back to exponential spacing
+- Adjust MIN_QUEUE_SIZE and MAX_SPREAD_CROSS if needed
 
 ### High Taker Ratio (>5%)
 - Increase MIN_SPREAD_BPS (1 → 2-3 bps)

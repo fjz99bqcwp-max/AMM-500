@@ -404,6 +404,49 @@ async def fetch_us500_data(days: int = 180) -> None:
         raise
 
 
+async def fetch_xyz100_data(days: int = 30) -> None:
+    """Fetch xyz100 (S&P 100) primary data via yfinance."""
+    logger.info(f"Fetching xyz100 (S&P 100) data via yfinance ({days} days)...")
+    
+    try:
+        from src.utils.xyz100_fallback import XYZ100FallbackFetcher
+        
+        fetcher = XYZ100FallbackFetcher()
+        
+        # Fetch xyz100 data
+        candles_df = await fetcher.fetch_xyz100_data(
+            days=days,
+            interval='1m'
+        )
+        
+        if candles_df is not None and len(candles_df) > 0:
+            # Save to data directory
+            output_path = Path("data") / f"xyz100_candles_1m_{days}d.csv"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            candles_df.to_csv(output_path, index=False)
+            
+            logger.info(f"✅ Fetched {len(candles_df)} xyz100 candles")
+            logger.info(f"✅ Data saved to: {output_path}")
+            logger.info(f"✅ Time range: {candles_df['timestamp'].min()} to {candles_df['timestamp'].max()}")
+            logger.info(f"✅ Price range: ${candles_df['close'].min():.2f} - ${candles_df['close'].max():.2f}")
+            
+            # Also save scaled version
+            scaled_path = Path("data") / "xyz100_scaled.csv"
+            candles_df.to_csv(scaled_path, index=False)
+            logger.info(f"✅ Scaled data saved to: {scaled_path}")
+        else:
+            logger.error("❌ Failed to fetch xyz100 data - DataFrame is empty")
+            logger.warning("Try: pip install yfinance --upgrade")
+            
+    except ImportError as e:
+        logger.error(f"❌ Missing dependency: {e}")
+        logger.info("Install yfinance: pip install yfinance")
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch xyz100 data: {e}")
+        logger.exception("Full traceback:")
+        raise
+
+
 # =============================================================================
 # Status Check
 # =============================================================================
@@ -499,6 +542,12 @@ For more information, see README.md
     )
 
     parser.add_argument(
+        "--reduce-only",
+        action="store_true",
+        help="Force reduce-only mode (only close positions, no new opens)",
+    )
+
+    parser.add_argument(
         "--backtest", action="store_true", help="Run backtest instead of live trading"
     )
 
@@ -524,6 +573,12 @@ For more information, see README.md
         "--fetch-data",
         action="store_true",
         help="Fetch US500 historical data (or BTC proxy if insufficient)",
+    )
+
+    parser.add_argument(
+        "--fetch-xyz100",
+        action="store_true",
+        help="Fetch xyz100 (S&P 100) primary data via yfinance",
     )
 
     parser.add_argument(
@@ -557,16 +612,27 @@ def main() -> None:
         logger.info("Paper trading mode enabled (mainnet data, simulated orders)")
         logger.info(f"Using mainnet for real {config.trading.symbol} market data")
 
+    # Handle reduce-only mode
+    if args.reduce_only:
+        config.execution.force_reduce_only = True
+        logger.warning("⚠️ REDUCE-ONLY MODE FORCED - Will only close positions, no new opens")
+
     # Setup logging
     setup_logging(config)
 
     # Validate config for live mode
-    if not config.network.testnet and not args.backtest and not args.status and not args.fetch_data:
+    if not config.network.testnet and not args.backtest and not args.status and not args.fetch_data and not args.fetch_xyz100:
         try:
             config.validate()
         except ValueError as e:
             logger.error(f"Configuration error: {e}")
             sys.exit(1)
+
+    # Handle xyz100 data fetching mode
+    if args.fetch_xyz100:
+        logger.info(f"Fetching xyz100 (S&P 100) data for {args.fetch_days} days...")
+        asyncio.run(fetch_xyz100_data(args.fetch_days))
+        return
 
     # Handle data fetching mode
     if args.fetch_data:
