@@ -37,10 +37,10 @@ class TradingConfig:
     leverage: int = 10  # Conservative for index (max 25x)
     max_net_exposure: float = 25000.0  # Lower exposure for index vs crypto
     collateral: float = 1000.0  # Starting collateral for paper trading
-    min_spread_bps: float = 1.0  # Tighter spread for US500 (lower vol)
+    min_spread_bps: float = 3.0  # Wider spread to avoid rate limits
     max_spread_bps: float = 50.0  # Max spread at high volatility
     order_size_fraction: float = 0.02  # 2% per order for index
-    order_levels: int = 20  # 20 levels for aggressive market making
+    order_levels: int = 10  # 10 levels to stay under API limits (40 orders max)
     fill_rate: float = 0.75  # Moderate fill rate (verified via backtest)
 
 
@@ -68,10 +68,10 @@ class RiskConfig:
 class ExecutionConfig:
     """Execution settings - optimized for fast delta-neutral on US500."""
 
-    rebalance_interval: float = 3.0  # 3s ultra-fast rebalancing
-    quote_refresh_interval: float = 1.0  # 1s quote refresh
+    rebalance_interval: float = 5.0  # 5s to avoid rate limits (was 3s)
+    quote_refresh_interval: float = 2.0  # 2s quote refresh (was 1s)
     max_orders_per_batch: int = 40
-    target_actions_per_day: int = 15000
+    target_actions_per_day: int = 5000  # Reduced from 15k to avoid rate limits
     paper_trading: bool = False
 
 

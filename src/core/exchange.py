@@ -961,8 +961,21 @@ class HyperliquidClient:
             if not orders_data:
                 return [None] * len(requests)
 
-            # Place batch
-            result = self._exchange.bulk_orders(orders_data)
+            # Place batch with rate limit retry
+            max_retries = 3
+            retry_delay = 2.0
+            for attempt in range(max_retries):
+                try:
+                    result = self._exchange.bulk_orders(orders_data)
+                    break
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str and attempt < max_retries - 1:
+                        logger.warning(f"Rate limited on attempt {attempt+1}/{max_retries}, retrying in {retry_delay}s...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    raise
 
             latency = self._order_latency.stop()
             logger.debug(f"Batch of {len(orders_data)} orders placed (latency: {latency:.1f}ms)")
@@ -1047,7 +1060,7 @@ class HyperliquidClient:
                             except Exception:
                                 pass  # Ignore parse errors
                         else:
-                            logger.warning(f"Order {i} failed: {repr(status)}")
+                            logger.warning(f"Order {i} failed: " + repr(status))
 
                 for i, (req, status) in enumerate(zip(requests, statuses)):
                     if status.get("resting"):
@@ -1083,7 +1096,7 @@ class HyperliquidClient:
 
         except Exception as e:
             self._order_latency.stop()
-            logger.error(f"Error placing batch orders: {e}")
+            logger.error(f"Error placing batch orders: {str(e)}")
             return [None] * len(requests)
 
     async def _simulate_orders_batch(self, requests: List[OrderRequest]) -> List[Optional[Order]]:
@@ -1312,7 +1325,21 @@ class HyperliquidClient:
                 api_symbol = f"km:{symbol}" if symbol == "US500" else symbol
                 cancel_requests.append(CancelRequest(coin=api_symbol, oid=int(order_id)))
 
-            result = self._exchange.bulk_cancel(cancel_requests)
+            # Rate limit retry with exponential backoff
+            max_retries = 3
+            retry_delay = 2.0
+            for attempt in range(max_retries):
+                try:
+                    result = self._exchange.bulk_cancel(cancel_requests)
+                    break
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str and attempt < max_retries - 1:
+                        logger.warning(f"Rate limited on cancel attempt {attempt+1}/{max_retries}, retrying in {retry_delay}s...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    raise
 
             if isinstance(result, dict) and result.get("status") == "ok":
                 for symbol, order_id in orders:
@@ -1330,7 +1357,7 @@ class HyperliquidClient:
                 return 0
 
         except Exception as e:
-            logger.error(f"Error in batch cancel: {e}")
+            logger.error(f"Error in batch cancel: {str(e)}")
             return 0
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:

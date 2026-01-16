@@ -378,13 +378,13 @@ class US500ProfessionalMM:
         self._last_order_sync = 0.0
         self._last_order_cleanup = 0.0  # Track periodic cleanup
         
-        # Config shortcuts - MODIFIED FOR 200 ORDERS
-        self.symbol = "US500"  # Hardcoded for US500-USDH
-        self.min_spread_bps = 1.0  # Start at 1 bps
-        self.max_spread_bps = 200.0  # +/-2% = 200 bps
-        self.order_levels = 100  # 100 levels per side
-        self.quote_interval = 2.0  # Slower refresh with 200 orders
-        self.rebalance_interval = 1.0  # 1s rebalance
+        # Config shortcuts - Use config values (not hardcoded)
+        self.symbol = config.trading.symbol
+        self.min_spread_bps = config.trading.min_spread_bps
+        self.max_spread_bps = config.trading.max_spread_bps
+        self.order_levels = config.trading.order_levels
+        self.quote_interval = config.execution.quote_refresh_interval
+        self.rebalance_interval = config.execution.rebalance_interval
         
         # Order memorization tracking
         self._order_memory: Dict[str, QuoteLevel] = {}  # All orders ever placed
