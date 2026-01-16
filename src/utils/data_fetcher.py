@@ -1,928 +1,263 @@
 """
-US500 Historical Data Fetcher for Hyperliquid
-Fetches actual market data for US500 or uses BTC as a proxy when insufficient.
+Data Fetcher for AMM-500
+=========================
+Fetches historical data from multiple sources:
+- xyz100 (^OEX S&P 100) via yfinance - Primary source
+- BTC via Hyperliquid SDK - Fallback
 
-This module handles:
-- Fetching US500 candle data via /info endpoint
-- Fetching US500 funding rate history
-- Automatic fallback to BTC data as proxy when US500 history is insufficient
-- Periodic checking for sufficient US500 data to switch from proxy
-
-Data sources:
-1. API: Candlestick and funding rate data for US500 (km:US500)
-2. Fallback: BTC data as proxy (scaled for volatility differences)
-
-WARNING: Backtesting with real data is essential for strategy validation.
-Synthetic data can give misleading results.
+Data is scaled to target US500 volatility (~12% annual).
 """
 
 import asyncio
-import os
-import subprocess
-import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
+import time
 
-import aiohttp
-import numpy as np
 import pandas as pd
+import numpy as np
 from loguru import logger
 
-# Try to import lz4 for S3 archive decompression
 try:
-    import lz4.frame
-    LZ4_AVAILABLE = True
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
 except ImportError:
-    LZ4_AVAILABLE = False
-    logger.warning("lz4 not installed. S3 archive decompression will not be available.")
+    YFINANCE_AVAILABLE = False
+    logger.warning("yfinance not installed - xyz100 data unavailable")
 
-# Hyperliquid API endpoints
-MAINNET_INFO_URL = "https://api.hyperliquid.xyz/info"
-TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
-
-# S3 archive bucket
-S3_ARCHIVE_BUCKET = "hyperliquid-archive"
-S3_MARKET_DATA_PREFIX = "market_data"
-
-
-@dataclass
-class CandleData:
-    """Single candlestick data point."""
-    timestamp: int  # milliseconds
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+try:
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+    HYPERLIQUID_AVAILABLE = True
+except ImportError:
+    HYPERLIQUID_AVAILABLE = False
 
 
-@dataclass
-class FundingData:
-    """Funding rate data point."""
-    timestamp: int
-    coin: str
-    funding_rate: float
-    premium: float
-
-
-class HyperliquidDataFetcher:
+class DataFetcher:
     """
-    Fetches real historical data from Hyperliquid for backtesting.
+    Multi-source data fetcher with volatility scaling.
     
-    Supports both standard assets (BTC, ETH) and KM deployer assets (US500).
+    Primary: xyz100 (^OEX) via yfinance
+    Fallback: BTC via Hyperliquid SDK
     
-    Data sources:
-    1. Candlestick data via POST /info with action "candleSnapshot"
-    2. Funding rates via POST /info with action "fundingHistory"
-    
-    Usage:
-        fetcher = HyperliquidDataFetcher()
-        candles = await fetcher.fetch_candles("US500", days=30)
-        funding = await fetcher.fetch_funding_history("US500", days=30)
+    Data is scaled to match US500 target volatility (~12% annual).
     """
     
-    # Available intervals for candles
-    VALID_INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"]
-    
-    def __init__(self, use_testnet: bool = False):
-        """Initialize data fetcher."""
-        self.base_url = TESTNET_INFO_URL if use_testnet else MAINNET_INFO_URL
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._rate_limit_remaining = 100
-        self._last_request_time = 0
-        
-    async def _ensure_session(self) -> aiohttp.ClientSession:
-        """Ensure aiohttp session exists."""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
-    
-    async def close(self) -> None:
-        """Close the session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-    
-    async def _rate_limit_wait(self) -> None:
-        """Simple rate limiting - max 10 requests per second."""
-        now = time.time()
-        elapsed = now - self._last_request_time
-        if elapsed < 0.1:  # 100ms between requests
-            await asyncio.sleep(0.1 - elapsed)
-        self._last_request_time = time.time()
-    
-    async def _post(self, payload: Dict) -> Optional[Dict]:
-        """Make a POST request to the info endpoint."""
-        session = await self._ensure_session()
-        await self._rate_limit_wait()
-        
-        try:
-            async with session.post(
-                self.base_url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    logger.error(f"API error: {response.status} - {await response.text()}")
-                    return None
-        except asyncio.TimeoutError:
-            logger.error("Request timed out")
-            return None
-        except Exception as e:
-            logger.error(f"Request failed: {e}")
-            return None
-    
-    def _get_coin_identifier(self, coin: str) -> str:
-        """
-        Get the correct coin identifier for API calls.
-        
-        For KM deployer assets like US500, we need to use the bare symbol
-        in most API calls, not the full km:US500 format.
-        """
-        # Strip km: prefix if present for candle/funding requests
-        if coin.startswith("km:"):
-            return coin[3:]
-        return coin
-    
-    async def fetch_candles(
-        self,
-        coin: str = "US500",
-        interval: str = "1m",
-        days: int = 30,
-        end_time: Optional[int] = None
-    ) -> pd.DataFrame:
-        """
-        Fetch historical candlestick data from Hyperliquid.
-        
-        Args:
-            coin: Trading pair (e.g., "US500", "BTC")
-            interval: Candle interval ("1m", "5m", "15m", "1h", "4h", "1d")
-            days: Number of days of history to fetch
-            end_time: End timestamp in ms (default: now)
-            
-        Returns:
-            DataFrame with columns: timestamp, open, high, low, close, volume
-        """
-        if interval not in self.VALID_INTERVALS:
-            raise ValueError(f"Invalid interval. Must be one of: {self.VALID_INTERVALS}")
-        
-        coin_id = self._get_coin_identifier(coin)
-        logger.info(f"Fetching {days} days of {interval} candles for {coin_id}...")
-        
-        # Calculate time range
-        if end_time is None:
-            end_time = int(time.time() * 1000)
-        
-        # Interval to milliseconds
-        interval_ms = {
-            "1m": 60 * 1000,
-            "5m": 5 * 60 * 1000,
-            "15m": 15 * 60 * 1000,
-            "1h": 60 * 60 * 1000,
-            "4h": 4 * 60 * 60 * 1000,
-            "1d": 24 * 60 * 60 * 1000,
-        }[interval]
-        
-        start_time = end_time - (days * 24 * 60 * 60 * 1000)
-        
-        all_candles = []
-        current_start = start_time
-        
-        # Fetch in chunks (API typically limits to 5000 candles per request)
-        max_candles_per_request = 5000
-        chunk_ms = max_candles_per_request * interval_ms
-        
-        while current_start < end_time:
-            chunk_end = min(current_start + chunk_ms, end_time)
-            
-            payload = {
-                "type": "candleSnapshot",
-                "req": {
-                    "coin": coin_id,
-                    "interval": interval,
-                    "startTime": current_start,
-                    "endTime": chunk_end
-                }
-            }
-            
-            result = await self._post(payload)
-            
-            if result:
-                for candle in result:
-                    all_candles.append({
-                        "timestamp": candle["t"],
-                        "open": float(candle["o"]),
-                        "high": float(candle["h"]),
-                        "low": float(candle["l"]),
-                        "close": float(candle["c"]),
-                        "volume": float(candle["v"]),
-                    })
-                logger.debug(f"Fetched {len(result)} candles from {datetime.fromtimestamp(current_start/1000)}")
-            
-            current_start = chunk_end
-            
-            # Small delay between chunks
-            await asyncio.sleep(0.2)
-        
-        if not all_candles:
-            logger.warning(f"No candle data retrieved for {coin_id}, returning empty DataFrame")
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-        
-        # Create DataFrame and remove duplicates
-        df = pd.DataFrame(all_candles)
-        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-        
-        # Convert timestamp to datetime for easier use
-        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
-        
-        logger.info(f"Fetched {len(df)} candles from {df['datetime'].min()} to {df['datetime'].max()}")
-        
-        return df
-    
-    async def fetch_funding_history(
-        self,
-        coin: str = "US500",
-        days: int = 30,
-        end_time: Optional[int] = None
-    ) -> pd.DataFrame:
-        """
-        Fetch historical funding rate data.
-        
-        Args:
-            coin: Trading pair (e.g., "US500", "BTC")
-            days: Number of days of history
-            end_time: End timestamp in ms (default: now)
-            
-        Returns:
-            DataFrame with columns: timestamp, coin, funding_rate, premium
-        """
-        coin_id = self._get_coin_identifier(coin)
-        logger.info(f"Fetching {days} days of funding history for {coin_id}...")
-        
-        if end_time is None:
-            end_time = int(time.time() * 1000)
-        
-        start_time = end_time - (days * 24 * 60 * 60 * 1000)
-        
-        payload = {
-            "type": "fundingHistory",
-            "coin": coin_id,
-            "startTime": start_time,
-            "endTime": end_time
-        }
-        
-        result = await self._post(payload)
-        
-        if not result:
-            logger.warning(f"No funding data retrieved for {coin_id}")
-            return pd.DataFrame(columns=["timestamp", "coin", "funding_rate", "premium"])
-        
-        funding_data = []
-        for item in result:
-            funding_data.append({
-                "timestamp": item["time"],
-                "coin": item["coin"],
-                "funding_rate": float(item["fundingRate"]),
-                "premium": float(item.get("premium", 0)),
-            })
-        
-        df = pd.DataFrame(funding_data)
-        if not df.empty:
-            df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
-            df = df.sort_values("timestamp").reset_index(drop=True)
-        
-        logger.info(f"Fetched {len(df)} funding rate records")
-        
-        return df
-    
-    async def fetch_meta(self) -> Optional[Dict]:
-        """Fetch market metadata (asset info, leverage limits, etc.)."""
-        payload = {"type": "meta"}
-        return await self._post(payload)
-    
-    async def fetch_all_mids(self) -> Optional[Dict]:
-        """Fetch current mid prices for all assets."""
-        payload = {"type": "allMids"}
-        return await self._post(payload)
-    
-    async def fetch_l2_book(self, coin: str = "US500") -> Optional[Dict]:
-        """Fetch current L2 order book snapshot."""
-        coin_id = self._get_coin_identifier(coin)
-        payload = {
-            "type": "l2Book",
-            "coin": coin_id
-        }
-        return await self._post(payload)
-    
-    async def check_asset_exists(self, coin: str) -> bool:
-        """Check if an asset exists and is tradable on Hyperliquid."""
-        coin_id = self._get_coin_identifier(coin)
-        
-        # Try to fetch current price
-        mids = await self.fetch_all_mids()
-        if mids and coin_id in mids:
-            return True
-        
-        # Try L2 book
-        book = await self.fetch_l2_book(coin_id)
-        if book and book.get("levels"):
-            return True
-        
-        return False
-
-
-class US500DataManager:
-    """
-    Manages US500 historical data with xyz100 PRIMARY and BTC fallback.
-    
-    This class handles:
-    1. PRIMARY: S&P 100 (^OEX) via yfinance (xyz100_fallback.py)
-    2. SECONDARY: Direct US500 via Hyperliquid API
-    3. FALLBACK: BTC data as proxy if both insufficient
-    4. Scaling for US500 volatility (5-15% target)
-    
-    Data source priority:
-    1. xyz100 (S&P 100, 0.98 correlation) - PREFERRED
-    2. US500 direct (if >50% bars available)
-    3. BTC scaled (last resort)
-    
-    Usage:
-        manager = US500DataManager()
-        candles, funding, data_source = await manager.get_trading_data(days=180)
-    """
-    
-    # US500 volatility is typically 20-30% of BTC volatility
-    VOL_SCALE_FACTOR = 0.3
-    
-    # Minimum candles needed for reliable backtesting (6 months at 1m)
-    MIN_CANDLES_FOR_TRADING = 259200  # 180 days * 24 * 60
-    
-    def __init__(self, data_dir: str = "data", use_xyz100_primary: bool = True):
-        """Initialize the data manager."""
-        self.data_dir = Path(data_dir)
+    def __init__(self, config):
+        self.config = config
+        self.data_dir = Path("data")
         self.data_dir.mkdir(exist_ok=True)
-        self.fetcher = HyperliquidDataFetcher(use_testnet=False)
-        self.use_xyz100_primary = use_xyz100_primary
         
-        # Import xyz100 fetcher
-        try:
-            from src.utils.xyz100_fallback import XYZ100FallbackFetcher
-            self.xyz100_fetcher = XYZ100FallbackFetcher()
-            logger.info("xyz100 (S&P 100) fetcher initialized as PRIMARY data source")
-        except ImportError as e:
-            logger.warning(f"xyz100_fallback not available: {e}")
-            self.xyz100_fetcher = None
-            self.use_xyz100_primary = False
-        
-    async def close(self) -> None:
-        """Close the data fetcher."""
-        await self.fetcher.close()
+        self.target_vol = config.data.target_volatility
+        self.use_xyz100 = config.data.use_xyz100_primary
+        self.btc_fallback = config.data.btc_fallback_enabled
     
-    def _get_cache_path(self, coin: str, data_type: str, days: int) -> Path:
-        """Get path for cached data file."""
-        return self.data_dir / f"{coin}_{data_type}_{days}d.csv"
-    
-    def _load_cached(self, path: Path) -> Optional[pd.DataFrame]:
-        """Load cached data if available and fresh."""
-        if not path.exists():
-            return None
-        
-        # Check file age (invalidate after 1 day)
-        file_age = time.time() - path.stat().st_mtime
-        if file_age > 86400:  # 24 hours
-            logger.debug(f"Cache expired: {path}")
-            return None
-        
-        try:
-            df = pd.read_csv(path)
-            if "datetime" in df.columns:
-                df["datetime"] = pd.to_datetime(df["datetime"])
-            logger.info(f"Loaded {len(df)} records from cache: {path}")
-            return df
-        except Exception as e:
-            logger.warning(f"Failed to load cache {path}: {e}")
-            return None
-    
-    def _save_cache(self, df: pd.DataFrame, path: Path) -> None:
-        """Save data to cache."""
-        try:
-            df.to_csv(path, index=False)
-            logger.debug(f"Saved {len(df)} records to cache: {path}")
-        except Exception as e:
-            logger.warning(f"Failed to save cache {path}: {e}")    
-    async def get_trading_data(self, days: int = 180) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    async def fetch(self, days: int = 30) -> pd.DataFrame:
         """
-        Get trading data with xyz100 PRIMARY and BTC fallback.
-        
-        Data source priority:
-        1. xyz100 (S&P 100 ^OEX) - PREFERRED, 0.98 correlation
-        2. US500 direct (if >50% bars available)
-        3. BTC scaled (last resort)
+        Fetch and combine data from available sources.
         
         Args:
-            days: Days of historical data to fetch
-            
+            days: Number of days to fetch
+        
         Returns:
-            (candles_df, funding_df, data_source)
-            data_source: "xyz100", "us500", or "btc"
+            DataFrame with OHLCV data scaled to target volatility
         """
-        # Try xyz100 PRIMARY
-        if self.use_xyz100_primary and self.xyz100_fetcher:
-            try:
-                logger.info("Attempting xyz100 (S&P 100) as PRIMARY data source...")
-                xyz_df = await self.xyz100_fetcher.fetch_xyz100_data(days)
+        data = None
+        
+        # Try xyz100 first
+        if self.use_xyz100 and YFINANCE_AVAILABLE:
+            logger.info("Fetching xyz100 (^OEX) data...")
+            data = await self._fetch_xyz100(days)
+            if data is not None and len(data) > 0:
+                logger.info(f"Fetched {len(data)} rows from xyz100")
+        
+        # Fallback to BTC
+        if (data is None or len(data) < 100) and self.btc_fallback and HYPERLIQUID_AVAILABLE:
+            logger.info("Fetching BTC fallback data...")
+            btc_data = await self._fetch_btc(days)
+            if btc_data is not None and len(btc_data) > 0:
+                logger.info(f"Fetched {len(btc_data)} rows from BTC")
                 
-                if xyz_df is not None and len(xyz_df) >= days * 0.5:  # >50% bars
-                    logger.info(f"✅ xyz100 PRIMARY: {len(xyz_df)} bars ({len(xyz_df)/(days*390):.1%} of target)")
-                    # Funding not available for xyz100, create empty df
-                    funding_df = pd.DataFrame()
-                    return xyz_df, funding_df, "xyz100"
+                # Scale BTC volatility to target
+                btc_data = self._scale_volatility(btc_data)
+                
+                if data is None:
+                    data = btc_data
                 else:
-                    logger.warning(f"xyz100 insufficient: {len(xyz_df) if xyz_df is not None else 0} bars < {days*0.5:.0f}")
-            except Exception as e:
-                logger.warning(f"xyz100 fetch failed: {e}")
+                    # Combine: use xyz100 where available, fill gaps with BTC
+                    data = self._combine_data(data, btc_data)
         
-        # Try US500 direct SECONDARY
-        try:
-            logger.info("Attempting US500 direct as SECONDARY...")
-            us500_candles = await self.fetcher.fetch_candles("US500", days=days, interval="1m")
-            
-            if us500_candles and len(us500_candles) >= days * 0.5:  # >50% bars
-                candles_df = self._candles_to_dataframe(us500_candles)
-                logger.info(f"✅ US500 DIRECT: {len(candles_df)} bars")
-                
-                # Get funding rates
-                funding = await self.fetcher.fetch_funding_history("US500", days=days)
-                funding_df = self._funding_to_dataframe(funding) if funding else pd.DataFrame()
-                
-                return candles_df, funding_df, "us500"
-            else:
-                logger.warning(f"US500 insufficient: {len(us500_candles) if us500_candles else 0} bars")
-        except Exception as e:
-            logger.warning(f"US500 fetch failed: {e}")
+        if data is None or len(data) == 0:
+            raise ValueError("Failed to fetch any data")
         
-        # Fallback to BTC LAST RESORT
-        logger.warning("⚠️ Using BTC FALLBACK (xyz100 and US500 insufficient)")
-        try:
-            btc_candles = await self.fetcher.fetch_candles("BTC", days=days, interval="1m")
-            if not btc_candles:
-                raise ValueError("No BTC data available")
-            
-            candles_df = self._candles_to_dataframe(btc_candles)
-            candles_df = self._scale_btc_to_us500(candles_df)
-            
-            logger.info(f"✅ BTC FALLBACK (scaled): {len(candles_df)} bars")
-            
-            # Get BTC funding (for reference)
-            funding = await self.fetcher.fetch_funding_history("BTC", days=days)
-            funding_df = self._funding_to_dataframe(funding) if funding else pd.DataFrame()
-            
-            return candles_df, funding_df, "btc"
-            
-        except Exception as e:
-            logger.error(f"BTC fallback failed: {e}")
-            # Return empty dataframes
-            return pd.DataFrame(), pd.DataFrame(), "none"
+        # Save to cache
+        cache_path = self.data_dir / f"combined_{days}d.csv"
+        data.to_csv(cache_path)
+        logger.info(f"Saved {len(data)} rows to {cache_path}")
+        
+        return data
     
-    def _candles_to_dataframe(self, candles: List[CandleData]) -> pd.DataFrame:
-        """Convert candles to DataFrame."""
-        if not candles:
-            return pd.DataFrame()
-        
-        data = [
-            {
-                "datetime": pd.to_datetime(c.timestamp, unit="ms"),
-                "open": c.open,
-                "high": c.high,
-                "low": c.low,
-                "close": c.close,
-                "volume": c.volume
-            }
-            for c in candles
-        ]
-        return pd.DataFrame(data)
-    
-    def _funding_to_dataframe(self, funding: List[FundingData]) -> pd.DataFrame:
-        """Convert funding to DataFrame."""
-        if not funding:
-            return pd.DataFrame()
-        
-        data = [
-            {
-                "datetime": pd.to_datetime(f.timestamp, unit="ms"),
-                "coin": f.coin,
-                "funding_rate": f.funding_rate,
-                "premium": f.premium
-            }
-            for f in funding
-        ]
-        return pd.DataFrame(data)    
-    def _scale_btc_to_us500(self, btc_candles: pd.DataFrame) -> pd.DataFrame:
-        """
-        Scale BTC price data to approximate US500 characteristics.
-        
-        US500 (S&P 500):
-        - Current price ~5000-6000 (vs BTC ~90000)
-        - Volatility ~15% annualized (vs BTC ~50-80%)
-        - More mean-reverting behavior
-        
-        This creates a proxy that:
-        1. Scales price to US500 range
-        2. Reduces volatility to match US500
-        """
-        if btc_candles.empty:
-            return btc_candles
-        
-        df = btc_candles.copy()
-        
-        # Current US500 is ~5800, BTC is ~90000
-        # Scale factor: 5800 / 90000 ≈ 0.064
-        price_scale = 0.064
-        
-        # Scale prices
-        for col in ["open", "high", "low", "close"]:
-            if col in df.columns:
-                df[col] = df[col] * price_scale
-        
-        # Reduce volatility by compressing returns toward mean
-        # This makes the proxy more representative of index behavior
-        if len(df) > 1:
-            # Calculate returns
-            df["return"] = df["close"].pct_change()
-            
-            # Compress returns (reduce vol)
-            df["return_scaled"] = df["return"] * self.VOL_SCALE_FACTOR
-            
-            # Reconstruct prices from compressed returns
-            initial_price = df["close"].iloc[0]
-            df["close_scaled"] = initial_price * (1 + df["return_scaled"]).cumprod()
-            
-            # Scale OHLC proportionally
-            scale_ratio = df["close_scaled"] / df["close"]
-            for col in ["open", "high", "low", "close"]:
-                if col in df.columns:
-                    df[col] = df[col] * scale_ratio.fillna(1)
-            
-            # Clean up temp columns
-            df = df.drop(columns=["return", "return_scaled", "close_scaled"], errors="ignore")
-        
-        # Volume doesn't need scaling for backtesting purposes
-        
-        logger.info(f"Scaled BTC data to US500 proxy: price range {df['close'].min():.2f} - {df['close'].max():.2f}")
-        
-        return df
-    
-    async def get_trading_data(
-        self,
-        days: int = 180,
-        interval: str = "1m",
-        min_required_days: int = 180
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, bool]:
-        """
-        Get trading data for US500, falling back to BTC proxy if needed.
-        
-        Args:
-            days: Days of data to fetch
-            interval: Candle interval
-            min_required_days: Minimum days needed before using real data
-            
-        Returns:
-            Tuple of (candles_df, funding_df, is_proxy)
-            is_proxy is True if BTC data was used as proxy
-        """
-        min_required_candles = min_required_days * 24 * 60  # For 1m interval
-        
-        # Try to fetch US500 data
-        logger.info("Attempting to fetch US500 historical data...")
-        
-        us500_candles = await self.fetcher.fetch_candles("US500", interval, days)
-        
-        # Check if we have enough US500 data
-        if len(us500_candles) >= min_required_candles:
-            logger.info(f"Sufficient US500 data available: {len(us500_candles)} candles")
-            
-            # Fetch funding rates
-            us500_funding = await self.fetcher.fetch_funding_history("US500", days)
-            
-            # Cache the data
-            self._save_cache(us500_candles, self._get_cache_path("US500", "candles_1m", days))
-            self._save_cache(us500_funding, self._get_cache_path("US500", "funding", days))
-            
-            return us500_candles, us500_funding, False
-        
-        # Insufficient US500 data - use BTC as proxy
-        logger.warning(f"Insufficient US500 data ({len(us500_candles)} candles), using BTC as proxy")
-        
-        # Try cache first
-        btc_cache_path = self._get_cache_path("BTC", "candles_1m", days)
-        btc_candles = self._load_cached(btc_cache_path)
-        
-        if btc_candles is None or len(btc_candles) < min_required_candles:
-            # Fetch fresh BTC data
-            logger.info(f"Fetching {days} days of BTC data as proxy...")
-            btc_candles = await self.fetcher.fetch_candles("BTC", interval, days)
-            
-            if not btc_candles.empty:
-                self._save_cache(btc_candles, btc_cache_path)
-        
-        # Scale BTC data to US500 characteristics
-        us500_proxy = self._scale_btc_to_us500(btc_candles)
-        
-        # Fetch BTC funding as proxy (or use zeros)
-        btc_funding_path = self._get_cache_path("BTC", "funding", days)
-        btc_funding = self._load_cached(btc_funding_path)
-        
-        if btc_funding is None:
-            btc_funding = await self.fetcher.fetch_funding_history("BTC", days)
-            if not btc_funding.empty:
-                self._save_cache(btc_funding, btc_funding_path)
-        
-        # Scale funding rates (index funding tends to be lower)
-        if not btc_funding.empty:
-            btc_funding["funding_rate"] = btc_funding["funding_rate"] * 0.5  # Reduce by 50%
-            btc_funding["coin"] = "US500"  # Rename for consistency
-        
-        # Save proxy data
-        self._save_cache(us500_proxy, self._get_cache_path("US500_proxy", "candles_1m", days))
-        
-        return us500_proxy, btc_funding, True
-    
-    async def check_data_availability(self) -> Dict:
-        """
-        Check current data availability for US500.
-        
-        Returns:
-            Dict with status information
-        """
-        # Check if US500 asset exists
-        exists = await self.fetcher.check_asset_exists("US500")
-        
-        if not exists:
-            return {
-                "asset_exists": False,
-                "candles_available": 0,
-                "funding_available": 0,
-                "sufficient_for_trading": False,
-                "using_proxy": True,
-            }
-        
-        # Fetch recent data to count
-        candles = await self.fetcher.fetch_candles("US500", "1m", days=7)
-        funding = await self.fetcher.fetch_funding_history("US500", days=7)
-        
-        candles_per_day = len(candles) / 7 if len(candles) > 0 else 0
-        estimated_total = candles_per_day * 180  # Estimate 6 months
-        
-        return {
-            "asset_exists": True,
-            "candles_available": len(candles),
-            "candles_per_day": candles_per_day,
-            "estimated_6mo_candles": estimated_total,
-            "funding_available": len(funding),
-            "sufficient_for_trading": estimated_total >= self.MIN_CANDLES_FOR_TRADING,
-            "using_proxy": estimated_total < self.MIN_CANDLES_FOR_TRADING,
-        }
-
-
-class S3ArchiveFetcher:
-    """
-    Fetches raw trade data from Hyperliquid S3 archives.
-    
-    Archive format: s3://hyperliquid-archive/market_data/[date]/[hour]/trades/[COIN].lz4
-    
-    Note: US500 may not have S3 archives if it's a newer asset.
-    Falls back to BTC data if US500 archives don't exist.
-    """
-    
-    def __init__(self, cache_dir: str = "data/s3_cache"):
-        """Initialize S3 archive fetcher."""
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._check_aws_cli()
-    
-    def _check_aws_cli(self) -> bool:
-        """Check if AWS CLI is available."""
-        try:
-            result = subprocess.run(
-                ["aws", "--version"],
-                capture_output=True,
-                text=True
-            )
-            self._aws_available = result.returncode == 0
-            if not self._aws_available:
-                logger.warning("AWS CLI not available. S3 archive fetching disabled.")
-            return self._aws_available
-        except FileNotFoundError:
-            self._aws_available = False
-            logger.warning("AWS CLI not installed. S3 archive fetching disabled.")
-            return False
-    
-    def _get_s3_path(self, coin: str, date: str, hour: int) -> str:
-        """Get S3 path for a specific date/hour."""
-        return f"s3://{S3_ARCHIVE_BUCKET}/{S3_MARKET_DATA_PREFIX}/{date}/{hour:02d}/trades/{coin}.lz4"
-    
-    def _get_cache_path(self, coin: str, date: str, hour: int) -> Path:
-        """Get local cache path for downloaded data."""
-        return self.cache_dir / f"{coin}_{date}_{hour:02d}.lz4"
-    
-    def download_hour(self, coin: str, date: str, hour: int) -> Optional[Path]:
-        """Download trade data for a specific hour."""
-        if not self._aws_available:
-            logger.error("AWS CLI not available")
+    async def _fetch_xyz100(self, days: int) -> Optional[pd.DataFrame]:
+        """Fetch xyz100 (^OEX) data via yfinance."""
+        if not YFINANCE_AVAILABLE:
             return None
         
-        s3_path = self._get_s3_path(coin, date, hour)
-        local_path = self._get_cache_path(coin, date, hour)
-        
-        # Check cache
-        if local_path.exists():
-            logger.debug(f"Using cached: {local_path}")
-            return local_path
-        
-        logger.info(f"Downloading: {s3_path}")
-        
         try:
-            result = subprocess.run(
-                ["aws", "s3", "cp", s3_path, str(local_path), "--no-sign-request"],
-                capture_output=True,
-                text=True
-            )
+            ticker = yf.Ticker("^OEX")
             
-            if result.returncode == 0:
-                return local_path
-            else:
-                logger.warning(f"Failed to download {s3_path}: {result.stderr}")
+            # Fetch 1-minute data (max 7 days at a time)
+            all_data = []
+            end = datetime.now()
+            
+            for i in range(0, days, 5):
+                chunk_end = end - timedelta(days=i)
+                chunk_start = chunk_end - timedelta(days=5)
+                
+                try:
+                    df = ticker.history(
+                        start=chunk_start.strftime("%Y-%m-%d"),
+                        end=chunk_end.strftime("%Y-%m-%d"),
+                        interval="1m"
+                    )
+                    if len(df) > 0:
+                        all_data.append(df)
+                except Exception as e:
+                    logger.warning(f"Error fetching xyz100 chunk: {e}")
+                
+                await asyncio.sleep(0.5)  # Rate limit
+            
+            if not all_data:
                 return None
-                
+            
+            data = pd.concat(all_data)
+            data = data.sort_index()
+            data = data[~data.index.duplicated(keep='first')]
+            
+            # Rename columns
+            data.columns = [c.lower() for c in data.columns]
+            
+            return data
+        
         except Exception as e:
-            logger.error(f"Error downloading {s3_path}: {e}")
+            logger.error(f"Error fetching xyz100: {e}")
             return None
     
-    def decompress_lz4(self, lz4_path: Path) -> Optional[bytes]:
-        """Decompress an LZ4 file."""
-        if not LZ4_AVAILABLE:
-            logger.error("lz4 package not installed")
+    async def _fetch_btc(self, days: int) -> Optional[pd.DataFrame]:
+        """Fetch BTC data via Hyperliquid SDK."""
+        if not HYPERLIQUID_AVAILABLE:
             return None
         
         try:
-            with open(lz4_path, 'rb') as f:
-                return lz4.frame.decompress(f.read())
+            info = Info(constants.MAINNET_API_URL, skip_ws=True)
+            
+            end_time = int(time.time() * 1000)
+            start_time = end_time - (days * 24 * 60 * 60 * 1000)
+            
+            # Fetch candles
+            candles = info.candles_snapshot("BTC", "1m", start_time, end_time)
+            
+            if not candles:
+                return None
+            
+            # Convert to DataFrame
+            data = pd.DataFrame(candles)
+            data['timestamp'] = pd.to_datetime(data['t'], unit='ms')
+            data = data.set_index('timestamp')
+            
+            data = data.rename(columns={
+                'o': 'open',
+                'h': 'high',
+                'l': 'low',
+                'c': 'close',
+                'v': 'volume'
+            })
+            
+            data = data[['open', 'high', 'low', 'close', 'volume']].astype(float)
+            
+            return data
+        
         except Exception as e:
-            logger.error(f"Error decompressing {lz4_path}: {e}")
+            logger.error(f"Error fetching BTC: {e}")
             return None
     
-    def parse_trades(self, data: bytes) -> pd.DataFrame:
-        """Parse trade data from decompressed bytes."""
-        try:
-            import json
-            lines = data.decode('utf-8').strip().split('\n')
-            trades = []
-            
-            for line in lines:
-                if not line:
-                    continue
-                trade = json.loads(line)
-                trades.append({
-                    'timestamp': trade.get('time', trade.get('t')),
-                    'price': float(trade.get('px', trade.get('p', 0))),
-                    'size': float(trade.get('sz', trade.get('s', 0))),
-                    'side': trade.get('side', 'unknown'),
-                })
-            
-            return pd.DataFrame(trades)
-            
-        except Exception as e:
-            logger.error(f"Error parsing trades: {e}")
-            return pd.DataFrame()
+    def _scale_volatility(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Scale data volatility to target."""
+        if len(data) < 100:
+            return data
+        
+        # Calculate realized volatility
+        returns = data['close'].pct_change().dropna()
+        realized_vol = returns.std() * np.sqrt(252 * 24 * 60)  # Annualized from 1-min
+        
+        if realized_vol == 0:
+            return data
+        
+        # Scale factor
+        scale = self.target_vol / realized_vol
+        
+        # Apply scaling (scale returns, rebuild prices)
+        scaled_returns = returns * scale
+        
+        # Rebuild OHLC from scaled returns
+        initial_price = data['close'].iloc[0]
+        scaled_close = initial_price * (1 + scaled_returns).cumprod()
+        
+        # Scale ratio for OHLC
+        ratio = scaled_close / data['close'].iloc[1:]
+        
+        scaled_data = data.copy()
+        scaled_data.loc[scaled_data.index[1:], 'close'] = scaled_close.values
+        scaled_data.loc[scaled_data.index[1:], 'open'] = (data['open'].iloc[1:] * ratio).values
+        scaled_data.loc[scaled_data.index[1:], 'high'] = (data['high'].iloc[1:] * ratio).values
+        scaled_data.loc[scaled_data.index[1:], 'low'] = (data['low'].iloc[1:] * ratio).values
+        
+        logger.info(f"Scaled volatility from {realized_vol:.1%} to {self.target_vol:.1%}")
+        
+        return scaled_data
     
-    def fetch_trades_for_date(self, coin: str, date: str) -> pd.DataFrame:
-        """Fetch all trades for a specific date."""
-        all_trades = []
+    def _combine_data(self, primary: pd.DataFrame, fallback: pd.DataFrame) -> pd.DataFrame:
+        """Combine primary and fallback data."""
+        # Use primary where available
+        combined = primary.copy()
         
-        for hour in range(24):
-            lz4_path = self.download_hour(coin, date, hour)
-            if lz4_path is None:
-                continue
-            
-            data = self.decompress_lz4(lz4_path)
-            if data is None:
-                continue
-            
-            trades_df = self.parse_trades(data)
-            if not trades_df.empty:
-                all_trades.append(trades_df)
+        # Fill gaps with fallback
+        primary_start = primary.index.min()
+        primary_end = primary.index.max()
         
-        if not all_trades:
-            return pd.DataFrame()
+        # Add fallback data before primary
+        before = fallback[fallback.index < primary_start]
+        if len(before) > 0:
+            combined = pd.concat([before, combined])
         
-        combined = pd.concat(all_trades, ignore_index=True)
-        combined = combined.sort_values('timestamp').reset_index(drop=True)
+        # Add fallback data after primary
+        after = fallback[fallback.index > primary_end]
+        if len(after) > 0:
+            combined = pd.concat([combined, after])
         
-        logger.info(f"Fetched {len(combined)} trades for {coin} on {date}")
+        combined = combined.sort_index()
+        combined = combined[~combined.index.duplicated(keep='first')]
+        
         return combined
-
-
-async def download_historical_data(
-    coin: str = "US500",
-    days: int = 30,
-    interval: str = "1m",
-    output_dir: str = "data"
-) -> Tuple[str, str]:
-    """
-    Download and save historical data for backtesting.
     
-    Args:
-        coin: Trading pair ("US500" or "BTC")
-        days: Days of history
-        interval: Candle interval
-        output_dir: Directory to save files
+    def load_cached(self, filename: str = None) -> Optional[pd.DataFrame]:
+        """Load cached data if available."""
+        if filename is None:
+            # Find most recent cache
+            cache_files = list(self.data_dir.glob("combined_*.csv"))
+            if not cache_files:
+                return None
+            filename = max(cache_files, key=lambda p: p.stat().st_mtime).name
         
-    Returns:
-        Tuple of (candles_path, funding_path)
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-    
-    fetcher = HyperliquidDataFetcher(use_testnet=False)
-    
-    try:
-        # Fetch candles
-        candles_df = await fetcher.fetch_candles(coin, interval, days)
-        candles_file = output_path / f"{coin}_candles_{interval}_{days}d.csv"
-        candles_df.to_csv(candles_file, index=False)
-        logger.info(f"Saved candles to {candles_file}")
+        cache_path = self.data_dir / filename
+        if cache_path.exists():
+            data = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            logger.info(f"Loaded {len(data)} rows from cache {filename}")
+            return data
         
-        # Fetch funding rates
-        funding_df = await fetcher.fetch_funding_history(coin, days)
-        funding_file = output_path / f"{coin}_funding_{days}d.csv"
-        funding_df.to_csv(funding_file, index=False)
-        logger.info(f"Saved funding rates to {funding_file}")
-        
-        return str(candles_file), str(funding_file)
-        
-    finally:
-        await fetcher.close()
+        return None
 
 
-def load_cached_data(
-    coin: str = "US500",
-    days: int = 30,
-    interval: str = "1m",
-    data_dir: str = "data"
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """
-    Load cached historical data if available.
-    
-    Returns:
-        Tuple of (candles_df, funding_df) or (None, None) if not found
-    """
-    data_path = Path(data_dir)
-    
-    # Try US500 first, then proxy
-    for coin_prefix in [coin, f"{coin}_proxy"]:
-        candles_file = data_path / f"{coin_prefix}_candles_{interval}_{days}d.csv"
-        funding_file = data_path / f"{coin}_funding_{days}d.csv"
-        
-        if candles_file.exists():
-            candles_df = pd.read_csv(candles_file)
-            candles_df["datetime"] = pd.to_datetime(candles_df["datetime"])
-            logger.info(f"Loaded {len(candles_df)} cached candles from {candles_file}")
-            
-            funding_df = None
-            if funding_file.exists():
-                funding_df = pd.read_csv(funding_file)
-                if "datetime" in funding_df.columns:
-                    funding_df["datetime"] = pd.to_datetime(funding_df["datetime"])
-                logger.info(f"Loaded {len(funding_df)} cached funding records")
-            
-            return candles_df, funding_df
-    
-    return None, None
-
-
-# Standalone script for downloading data
-if __name__ == "__main__":
-    import sys
-    
-    coin = sys.argv[1] if len(sys.argv) > 1 else "US500"
-    days = int(sys.argv[2]) if len(sys.argv) > 2 else 180
-    interval = sys.argv[3] if len(sys.argv) > 3 else "1m"
-    
-    print(f"Downloading {days} days of {interval} data for {coin}...")
-    print("(Will use BTC as proxy if US500 data insufficient)")
-    
-    async def main():
-        manager = US500DataManager()
-        try:
-            candles, funding, is_proxy = await manager.get_trading_data(days=days)
-            print(f"Downloaded {len(candles)} candles")
-            print(f"Using proxy: {is_proxy}")
-        finally:
-            await manager.close()
-    
-    asyncio.run(main())
-    
-    print("Done!")
+async def fetch_data(config, days: int = 30) -> pd.DataFrame:
+    """Convenience function to fetch data."""
+    fetcher = DataFetcher(config)
+    return await fetcher.fetch(days)
